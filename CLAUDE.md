@@ -228,7 +228,13 @@ upper clamp (covariance adjusts trust). §1.3.
 - **Calibration is tied to the ASSEMBLY, not the place** — any part change invalidates it.
   Recalibrated 2026-08-25 (pressure assembly): **scatter 3.4 %, dip 140.3° vs 143 expected** — the
   best yet; hard iron (−7.5, +20.5, −83.8) µT, back to chip-Z dominance like the 08-06 strip state.
-  Supersedes 2026-08-17 assembled (6.1 %, 137.2°, (+9.9, +61.6, −16.1)) (§9, §10.2). Tumble in one spot,
+  Supersedes 2026-08-17 assembled (6.1 %, 137.2°, (+9.9, +61.6, −16.1)) (§9, §10.2). **INVALID since
+  2026-09-08**: a `magneto_cal.py` run on 2026-09-02 16:08 wrote a diverged fit (bias 7420 / 1422.7 /
+  1357.12 µT, scale 1/1/1 — the EKF dip check reads 70°) and it was swept into a docs commit unnoticed;
+  the 08-25 values were restored from git on 09-08, but they no longer fit the current assembly either
+  (dip 175.5°, |m| 105 µT — the −84 µT chip-Z hard-iron source moved with the sensor swap).
+  **Recalibrate before trusting yaw**; until then the mag gate rejects every sample and the EKF is
+  effectively 6-DOF (§12.4). Tumble in one spot,
   ≥1 m from steel; **never calibrate from a flat spin** (it cannot see the vertical offset). File:
   **`~/ros2_ws/config/mag_calib_params.txt`** — moved out of `log_csv/` on 2026-08-25 after that file
   went missing in a log cleanup and the EKF spent an unknown period on source-code defaults (dip 11.1°,
