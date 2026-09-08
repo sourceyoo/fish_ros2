@@ -202,6 +202,8 @@ upper clamp (covariance adjusts trust). §1.3.
   (`press_fail_streak_`). `mux_probe.py` used to call this "정상"; since 2026-09-04 it runs a
   third stage that converts an actual pressure, and reports `ADC 사망`. Sensor vs connector is
   settled by swapping the suspect into a known-good channel.
+  **All three units were replaced on 2026-09-08** — now C1 41899 / 43494 / 42949 on ch0/1/2, every
+  ADC alive for the first time, roles re-verified by blow test (`config/port_map.txt`).
 - `SERVO_MIN_US`/`SERVO_MAX_US` (1325/1675 since 2026-08-26 — horn ≈ ±20° on the HS-5086WP's
   0.114°/µs) in `pid_control_node.cpp` **must stay inside the nRF firmware's `MotorControl.cpp`
   window (1250/1750)** — narrower here is safe (the nRF clamp never triggers); wider is not.
@@ -212,6 +214,10 @@ upper clamp (covariance adjusts trust). §1.3.
 - **Failure is a supported state**: 500 ms of AK8963 silence → automatic 9-DOF → 6-DOF fallback. It
   is alive (~94 Hz since 2026-07-31), so the system runs 9-DOF; yaw drift there is +0.04°/min. The
   −8°/min figure is 6-DOF-only, and no 6-DOF drift number survives a session (§3.2, §6.3).
+  **A boot with the IMU unreachable stays 6-DOF for that whole run** (2026-09-08): `i2c_driver_node`
+  probes MPU9250 (0x68, bypass) and AK8963 once at init and never retries, so a loose **J4**
+  connector (disturbed during the pressure-sensor swap) gives one boot-time WARN and silent 6-DOF.
+  Diagnostic: `i2cget -y 1 0x68 0x75` must answer `0x71`; fix = reseat J4, then restart the node.
 - **Axis remap `(my, mx, −mz)` is verified and PERMANENT** (tumble 2026-08-06, dip 144.3° vs Korea's
   143°); the code comment's derivation is bogus but the answer is measured — do not reopen (§4.2).
 - **Ellipsoid fit only; min/max retired 2026-08-17** — it measured *worse than no calibration*
