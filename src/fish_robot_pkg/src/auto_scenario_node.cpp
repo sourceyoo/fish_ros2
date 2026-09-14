@@ -15,7 +15,7 @@
 //  **btn1+btn2 동시 누름** = 시나리오 전환. state_estimation_ekf_node 가 조합을
 //  감지해 `/ui/scenario_next` 를 발행하고, 이 노드가 `combo_list` 를 한 칸 돌린다.
 //  기본 목록은 "straight,dive" — 직진과 "같은 추력으로 코를 숙이고 전진" 둘이다.
-//     ros2 param set /auto_scenario_node combo_list "straight,dive,turn"
+//     ros2 param set /auto_scenario_node combo_list "straight,dive,climb"
 //
 //  ※ 조합은 **모드를 바꾸지 않는다.** 시나리오만 갈아 끼우고, 실제 주행은 btn1 단독
 //     누름으로 AUTO 에 들어갈 때 시작된다. 전환은 저널에 크게 남는다 — 지금 무엇이
@@ -40,14 +40,13 @@
 //    straight  (기본) 수평 직진.                     ← 물속 첫 검증용
 //    dive      코를 angle_deg 만큼 아래로 하고 전진   (이 로봇은 **양수 피치 = 코 아래**)
 //    climb     코를 angle_deg 만큼 위로 하고 전진
-//    turn      진입 시점 헤딩에서 angle_deg 만큼 튼 헤딩을 목표로 전진
 //    porpoise  3초마다 피치 ±10° 왕복하며 전진        (구 시나리오. run_sec 을 늘려 쓸 것)
 //    attitude  추력 0 으로 피치 ±10° 왕복             ← 벤치에서 서보만 볼 때
 //
-//  ※ turn 의 한계: pid_control_node 의 요 오차는 `target - robot` 이고 **±180
-//     경계를 감싸지 않는다.** 진입 헤딩이 ±180 부근이면 목표가 경계를 넘으면서
-//     로봇이 먼 쪽으로 돌 수 있다. 경계에서 떨어진 곳에서 쓰거나, PID 쪽에
-//     wrap 을 넣은 뒤 쓸 것.
+//  ※ 요 목표 없음 (2026-09-14, 운용자 결정): pid_control_node 가 요 제어를 걷어내
+//     요 서보를 중앙에 고정했으므로 이 노드도 헤딩을 다루지 않는다. /auto/command 의
+//     z 는 항상 0 이고 PID 는 그 값을 읽지 않는다. 헤딩을 틀던 `turn` 시나리오도 뺐다
+//     (지정하면 "모르는 시나리오" 로 거부된다).
 //
 //  ※ 모드 전달 규약: state_estimation_ekf_node가 자동 모드일 때 roll 값에 ±5000을
 //     더해 발행한다. 별도 모드 토픽 없이 자세 토픽 하나로 모드를 함께 실어 나르는
@@ -70,21 +69,18 @@
 class AutoScenarioNode : public rclcpp::Node {
 public:
     // 시나리오 한 단계. 각도는 도(deg), 추력은 % (음수면 throttle_pct 를 쓴다).
-    // yaw 는 **진입 시점 헤딩 기준 상대각**이다 — 절대 방위가 아니다.
+    // 요 칸은 없다 — 요 제어 없음 (2026-09-14).
     struct Step {
         double sec;
         double roll;
         double pitch;
-        double yaw_rel;
         double thr_pct;
     };
 
     AutoScenarioNode() : Node("auto_scenario_node"),
                          is_auto_mode_(false),
                          prev_auto_mode_(false),
-                         run_done_logged_(false),
-                         last_yaw_(0.0f),
-                         entry_yaw_(0.0f)
+                         run_done_logged_(false)
     {
         // ── 파라미터 (기본값의 진실원은 여기 한 곳) ────────────────────────
         scenario_     = this->declare_parameter<std::string>("scenario", "straight");
@@ -104,7 +100,7 @@ public:
                         if (!is_known_scenario(v)) {
                             r.successful = false;
                             r.reason = "모르는 시나리오: " + v +
-                                       " (straight/dive/climb/turn/porpoise/attitude)";
+                                       " (straight/dive/climb/porpoise/attitude — turn 은 요 제어 제거로 없음)";
                             RCLCPP_ERROR(this->get_logger(), "[AUTO] %s", r.reason.c_str());
                             continue;
                         }
@@ -142,7 +138,7 @@ public:
             "/ui/scenario_next", 10,
             [this](const std_msgs::msg::Empty::SharedPtr) { advance_scenario(); });
 
-        // 자세 토픽은 모드 감별과 진입 헤딩 포착에만 쓴다 (제어각은 PID 노드가 쓴다)
+        // 자세 토픽은 모드 감별에만 쓴다 (제어각은 PID 노드가 쓴다)
         attitude_sub_ = this->create_subscription<geometry_msgs::msg::Vector3>(
             "/filtered/attitude", 10, std::bind(&AutoScenarioNode::attitude_callback, this, std::placeholders::_1));
 
@@ -188,20 +184,20 @@ private:
 
     static bool is_known_scenario(const std::string &s) {
         return s == "straight" || s == "dive" || s == "climb"
-            || s == "turn"     || s == "porpoise" || s == "attitude";
+            || s == "porpoise" || s == "attitude";
     }
 
     // ── 시나리오 정의 — 새 시나리오는 여기에 한 갈래 추가하면 끝난다 ──────
     std::vector<Step> build_steps() const {
         const double A = angle_deg_;
-        if (scenario_ == "dive")     return {{run_sec_, 0.0,  A,   0.0, -1.0}};
-        if (scenario_ == "climb")    return {{run_sec_, 0.0, -A,   0.0, -1.0}};
-        if (scenario_ == "turn")     return {{run_sec_, 0.0,  0.0, A,   -1.0}};
-        if (scenario_ == "porpoise") return {{3.0, 0.0,  10.0, 0.0, -1.0},
-                                             {3.0, 0.0, -10.0, 0.0, -1.0}};
-        if (scenario_ == "attitude") return {{3.0, 0.0,  10.0, 0.0,  0.0},
-                                             {3.0, 0.0, -10.0, 0.0,  0.0}};
-        return {{run_sec_, 0.0, 0.0, 0.0, -1.0}};    // straight (기본)
+        // 칸 순서: {지속초, 롤, 피치, 추력%}
+        if (scenario_ == "dive")     return {{run_sec_, 0.0,  A,   -1.0}};
+        if (scenario_ == "climb")    return {{run_sec_, 0.0, -A,   -1.0}};
+        if (scenario_ == "porpoise") return {{3.0, 0.0,  10.0, -1.0},
+                                             {3.0, 0.0, -10.0, -1.0}};
+        if (scenario_ == "attitude") return {{3.0, 0.0,  10.0,  0.0},
+                                             {3.0, 0.0, -10.0,  0.0}};
+        return {{run_sec_, 0.0, 0.0, -1.0}};    // straight (기본)
     }
 
     // 추력 % -> ESC PWM(us). 1000 = 정지, 2000 = 최대.
@@ -211,18 +207,10 @@ private:
         return static_cast<uint16_t>(1000.0 + pct * 10.0);
     }
 
-    // 헤딩을 (-180, 180] 로 접는다.
-    static double wrap180(double d) {
-        while (d >  180.0) d -= 360.0;
-        while (d <= -180.0) d += 360.0;
-        return d;
-    }
-
     void attitude_callback(const geometry_msgs::msg::Vector3::SharedPtr msg) {
         // roll 에 실린 ±5000 오프셋으로 모드 감별.
         // roll 실제 범위는 ±180도이므로 |x| > 2500 이면 오프셋이 실린 것 = 자동 모드.
         is_auto_mode_ = (msg->x > 2500.0f || msg->x < -2500.0f);
-        last_yaw_     = msg->z;    // 진입 시점 헤딩을 잡아두기 위해 계속 받아둔다
     }
 
     void scenario_loop_callback() {
@@ -241,15 +229,14 @@ private:
             active_run_sec_  = run_sec_;
             active_thr_pct_  = throttle_pct_;
             active_steps_    = build_steps();
-            entry_yaw_       = last_yaw_;
 
             double table_sec = 0.0;
             for (const auto &s : active_steps_) table_sec += s.sec;
 
             RCLCPP_WARN(this->get_logger(), "=========================================");
             RCLCPP_WARN(this->get_logger(),
-                "[AUTO SCENARIO] 시작! '%s'  %.1f초  추력 %.0f%%  진입 헤딩 %.1f도",
-                active_scenario_.c_str(), active_run_sec_, active_thr_pct_, entry_yaw_);
+                "[AUTO SCENARIO] 시작! '%s'  %.1f초  추력 %.0f%%",
+                active_scenario_.c_str(), active_run_sec_, active_thr_pct_);
             if (table_sec > active_run_sec_ + 1e-6) {
                 RCLCPP_WARN(this->get_logger(),
                     "[AUTO SCENARIO] 주의: 단계표가 %.1f초인데 run_sec 은 %.1f초 — "
@@ -273,18 +260,18 @@ private:
                     u -= s.sec;
                 }
 
-                // 3. 단위 규약: x/y/z 는 0.1도 단위(PID 가 *0.1f 로 환산), w 는 PWM(us).
-                //    yaw 는 진입 헤딩 기준 상대각이라 여기서 절대각으로 바꿔 보낸다.
+                // 3. 단위 규약: x/y 는 0.1도 단위(PID 가 *0.1f 로 환산), w 는 PWM(us).
+                //    z(요)는 항상 0 — 요 제어 없음 (2026-09-14), PID 도 읽지 않는다.
                 const double thr_pct = (cur->thr_pct < 0.0) ? active_thr_pct_ : cur->thr_pct;
                 cmd_msg.x = cur->roll  * 10.0;
                 cmd_msg.y = cur->pitch * 10.0;
-                cmd_msg.z = wrap180(entry_yaw_ + cur->yaw_rel) * 10.0;
+                cmd_msg.z = 0.0;
                 cmd_msg.w = static_cast<double>(pct_to_pwm(thr_pct));
 
                 RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                    "[SCENARIO RUN] '%s' %.1f/%.1f초  롤 %.1f 피치 %.1f 요 %.1f도  추력 %.0f%%",
+                    "[SCENARIO RUN] '%s' %.1f/%.1f초  롤 %.1f 피치 %.1f도  추력 %.0f%%",
                     active_scenario_.c_str(), elapsed, active_run_sec_,
-                    cmd_msg.x * 0.1, cmd_msg.y * 0.1, cmd_msg.z * 0.1, thr_pct);
+                    cmd_msg.x * 0.1, cmd_msg.y * 0.1, thr_pct);
             } else {
                 // 4. 주행 종료 — 추력을 끊고 수평을 계속 지시한다.
                 //    (자세 지시를 놓으면 목표가 사라지는 게 아니라 마지막 값이 남으므로
@@ -318,8 +305,6 @@ private:
     bool is_auto_mode_;
     bool prev_auto_mode_;      // 상태 전이 판별용 과거 상태
     bool run_done_logged_;     // 종료 로그를 한 번만 찍기 위한 래치
-    float last_yaw_;           // 최신 헤딩 (진입 순간 포착용)
-    float entry_yaw_;          // 이번 주행의 기준 헤딩
 
     // 설정값 (파라미터, 언제든 바뀔 수 있다)
     std::string scenario_;

@@ -28,7 +28,7 @@
 | 4 | AutoMode | — | /filtered/attitude | 0 = 수동, 1 = 자동 (attitude.x의 ±5000 해독) |
 | 5–7 | Roll, Pitch, Yaw | 도 | /filtered/attitude (100 Hz) | EKF 융합 자세. ±5000 제거 후 값, Yaw는 btn2 영점 적용. **양수 pitch = 코 아래** (항공 규약 반대) |
 | 8–11 | RC_T, RC_R, RC_P, RC_Y | 원시 정수 | /rc/command (100 Hz) | 스틱값. **−9999 = 링크 두절, 무필터 기록** (두절 구간을 눈으로 찾는 용도) |
-| 12–15 | M1–M4 | µs | /motor/output (100 Hz) | 좌서보 / 우서보 / 요서보 / 꼬리 BLDC |
+| 12–15 | M1–M4 | µs | /motor/output (100 Hz) | 좌서보 / 우서보 / 요서보(**2026-09-14 부터 1500 고정**, 요 제어 없음) / 꼬리 BLDC |
 | 16 | RPM | rpm | /sensor/tail_rpm (10 Hz) | 꼬리 회전수. 분해능 200 RPM |
 | 17–19 | P0–P2_cal | mbar | /sensor/pressure_calibrated (~11 Hz) | 영점 보정 수압(게이지). **죽은 채널 = `nan`** (2026-08-20 이전 파일은 0.0), 웜업 **180초** 전엔 미발행이라 초기값 0.0이 유지된다 |
 | 20–22 | T0–T2 | °C | /sensor/pressure_raw (~11 Hz) | 채널별 원시 온도 — 압력 드리프트 진단용 |

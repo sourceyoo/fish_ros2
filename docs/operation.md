@@ -21,7 +21,8 @@
 - **1초를 넘기고 3초가 안 되면 아무 일도 없다** — 짧지도 길지도 않은 구간은 무시된다.
 - 3초는 `== 300틱` 판정이라 계속 눌러도 한 번만 발동하고, 손을 뗄 때 짧은 누름으로 세지 않는다.
 
-스틱: 좌우 스틱이 roll/pitch/yaw **목표 자세**(±25.5°)와 스로틀이다. 스틱은 서보를
+스틱: 좌우 스틱이 roll/pitch **목표 자세**(±25.5°)와 스로틀이다. **요 스틱은 쓰지 않는다** —
+2026-09-14 부터 요 제어가 없고 요 서보는 중앙(1500)에 고정이다. 스틱은 서보를
 직접 미는 게 아니라 "이 자세로 가라"는 목표를 주고, PID가 그 목표를 추적한다.
 
 시스템 구성 요약: Pi 5(추정·제어·기록, ROS2 노드 8개) ↔ UART ↔ nRF52840(조종기 링크,
@@ -93,8 +94,9 @@ journalctl -u fish-robot -b | head -80      # 또는 --since "-5min"
 [INFO] [EKF] 복각 기준 확보: 140.4도 (기대 143.0도, 편차 2.6도)
 [INFO] [Hydro]   포트 배정: 정체압=ch0, 정압좌=ch1, 정압우=ch2  (파일, 물리확인 완료)
 [INFO] [Hydro] 부호 검증: pitch=+10도(기수 아래), roll=0 -> dP_hydro=+2.988 mbar
-[INFO] [PID Control] 게인: roll 8.75/0.00/0.00  pitch 8.75/0.00/0.00  yaw 1.20/0.00/0.00
-[INFO] [PID Control] 서보 반전: 좌 0 / 우 1 / 요 0  스틱 데드밴드: rpy 15, 스로틀 40
+[INFO] [PID Control] 게인: roll 8.75/0.00/0.00  pitch 8.75/0.00/0.00 (kp/ki/kd)
+[INFO] [PID Control] 요 제어 없음: 요 서보 1500 고정, 요 스틱·시나리오 요 목표 무시 (2026-09-14)
+[INFO] [PID Control] 서보 반전: 좌 0 / 우 1  스틱 데드밴드: rp 15, 스로틀 40
 ...180초 후...
 [INFO] [Hydro] 대기압 영점 포착 완료 (3채널)
 [INFO] [Hydro] q 영점을 공기 Δb 로 채웠습니다: 0.8250 mbar (...)  ← 속도 준비 완료
@@ -135,7 +137,7 @@ journalctl -u fish-robot -b | head -80      # 또는 --since "-5min"
 
 - [ ] 🎮 **스로틀 스틱 최하** — 벤치 작업 내내 유지하는 습관
 - [ ] 부품·하우징을 만졌다면 → **3.2 지자기 텀블** (안 만졌으면 불필요)
-- [ ] 🎮 **btn2 짧게** — 출발 방향을 yaw 0°로 (매 세션)
+- [ ] 🎮 **btn2 짧게** — 출발 방향을 yaw 0°로 (선택 — 요 제어가 없어 로그 읽기용일 뿐이다)
 - [ ] 대기압 영점 — 켠 지 180초 지났으면 **자동으로 끝나 있다.** 하우징을 열었다 닫았거나
       오래 켜뒀으면 🎮 **btn1 3초** 로 다시 (3.3)
 - [ ] 👀 **서보 방향 확인** (3.4) — 피치 기울임 = 두 지느러미 **같은** 방향, 롤 = **반대** 방향
@@ -150,7 +152,7 @@ journalctl -u fish-robot -b | head -80      # 또는 --since "-5min"
 | 자이로 영점 | 매 부팅 자동 | 켠 뒤 10초 정지 | 아무 데나 |
 | 대기압 영점 (수심) | 매 부팅 자동 (180초) | 재영점은 btn1 3초 | **공기 중만** |
 | 공기 Δb (속도 q 영점) | 대기압 영점에 **자동 포함** | 별도 조작 없음 | 공기 중 |
-| 헤딩 영점 | 매 세션 | btn2 짧게 | 출발 방향 보고 |
+| 헤딩 영점 | 선택 (요 제어 없음, 로그용) | btn2 짧게 | 출발 방향 보고 |
 | 지자기 (타원체) | **부품이 바뀌었을 때만** | btn2 3초 + 텀블 | 강철 1 m 밖 |
 | 물속 q 영점 | **선택** — 정지 속도 오차가 보일 때만 | `/hydro/zero_q` 서비스 | 물속 15 cm+ |
 
@@ -209,7 +211,7 @@ MANUAL, 스틱 중립에서 로봇을 손으로 기울인다:
 우측 서보는 거울상 장착이라 소프트웨어가 반전한다(`servo_reverse_right` 기본 true).
 방향이 반대로 보이는 채널은 재빌드 없이 즉석 반전:
 ```bash
-ros2 param set /pid_control_node servo_reverse_left true    # 또는 right/yaw, true/false
+ros2 param set /pid_control_node servo_reverse_left true    # 또는 right, true/false (요 서보는 중앙 고정이라 반전 파라미터 없음)
 ```
 서보 조향각은 혼 기준 **±20°** (HS-5086WP, 1325~1675 µs), 오차 1° = 혼 1°, 20°에서 최대.
 
@@ -246,7 +248,7 @@ ros2 param set /pid_control_node servo_reverse_left true    # 또는 right/yaw, 
 ### 4.3 AUTO 모드 (🎮 btn1 짧게)
 
 기본 시나리오(2026-09-14 변경, 종전 20 %·8초): **수평 자세로 추력 40 %(PWM 1400), 6초 전진 후 정지.**
-자세는 전 구간 roll/pitch/yaw 0°를 지시하고, 6초가 지나면 추력만 1000으로 끊는다.
+자세는 전 구간 roll/pitch 0°를 지시하고(요는 제어하지 않는다), 6초가 지나면 추력만 1000으로 끊는다.
 **다시 달리려면 btn1 으로 MANUAL 로 나갔다가 AUTO 로 재진입**한다(진입 순간 스톱워치가
 0으로 리셋된다). 종전의 6초 주기 피치 ±10° 왕복은 물속 첫 검증을 위해 걷어냈다 —
 자세를 흔들면 추력 문제인지 자세 문제인지 가릴 수 없기 때문이다.
@@ -259,9 +261,10 @@ ros2 param set /pid_control_node servo_reverse_left true    # 또는 right/yaw, 
 | `straight` (기본) | 수평 직진 |
 | `dive` | 코를 `angle_deg` 만큼 **아래로** 하고 전진 (이 로봇은 양수 피치 = 코 아래) |
 | `climb` | 코를 `angle_deg` 만큼 위로 하고 전진 |
-| `turn` | **진입 시점 헤딩**에서 `angle_deg` 만큼 튼 헤딩을 목표로 전진 |
 | `porpoise` | 3초마다 피치 ±10° 왕복하며 전진 (`run_sec` 을 늘려 쓸 것) |
 | `attitude` | 추력 0 으로 피치 ±10° 왕복 — 벤치에서 서보만 볼 때 |
+
+`turn`(헤딩 틀기)은 2026-09-14 요 제어 제거와 함께 없앴다 — 지정하면 모르는 시나리오로 거부된다.
 
 **`angle_deg` 는 지느러미 각이 아니라 목표 자세다.** 지느러미는 *오차*에 비례해 꺾이고
 (`kp` 8.75 → 피치 오차 1° = 혼 1°), 혼의 한계는 **±20°** 다. 그래서 수평에서 출발할 때:
@@ -298,7 +301,7 @@ btn1 단독           →  AUTO 진입 — 그때 걸려 있는 시나리오가 
 ```
 [EKF] 두 버튼 동시 3초 — AUTO 시나리오 전환 신호를 보냈습니다.
 [AUTO] 시나리오 전환 -> 'dive'  (2/2)  3.0초 추력 20% 각도 15.0도
-[AUTO SCENARIO] 시작! 'dive'  3.0초  추력 20%  진입 헤딩 8.8도
+[AUTO SCENARIO] 시작! 'dive'  3.0초  추력 20%
 ```
 
 3초를 못 채웠을 때는 이렇게 남는다:
@@ -306,12 +309,12 @@ btn1 단독           →  AUTO 진입 — 그때 걸려 있는 시나리오가 
 [EKF] 두 버튼 조합이 3초에 못 미쳐(1.2초) 시나리오를 바꾸지 않았습니다.
 ```
 
-목록은 바꿀 수 있다: `ros2 param set /auto_scenario_node combo_list "straight,dive,turn"`
+목록은 바꿀 수 있다: `ros2 param set /auto_scenario_node combo_list "straight,dive,climb"`
 
 #### 터미널로 전환
 
 ```bash
-ros2 param set /auto_scenario_node scenario dive    # straight/dive/climb/turn/porpoise/attitude
+ros2 param set /auto_scenario_node scenario dive    # straight/dive/climb/porpoise/attitude
 ros2 param set /auto_scenario_node run_sec 5.0
 ros2 param set /auto_scenario_node throttle_pct 30.0
 ros2 param set /auto_scenario_node angle_deg 15.0
@@ -323,12 +326,10 @@ ros2 param set /auto_scenario_node angle_deg 15.0
 한 값으로 확정되게 하기 위해서다. 진입하면 저널에 이렇게 찍힌다:
 
 ```
-[AUTO SCENARIO] 시작! 'dive'  5.0초  추력 20%  진입 헤딩 12.3도
+[AUTO SCENARIO] 시작! 'dive'  5.0초  추력 20%
 ```
 
 파라미터는 **재시작하면 사라진다**(기본값으로 복귀). 고정하려면 소스 기본값을 바꿀 것.
-`turn` 의 한계: PID 의 요 오차가 `target - robot` 이라 **±180 경계를 감싸지 않는다** —
-진입 헤딩이 ±180 부근이면 먼 쪽으로 돌 수 있다.
 
 ⚠️ **진입 즉시 추력이 걸린다** — 물 밖에서 실수로 누르면 꼬리가 3초간 20 %로 돈다.
 ESC 는 정상 동작이 확인된 부품이므로 **모터 전원이 붙어 있으면 정말로 돈다** —

@@ -13,6 +13,12 @@
 //              즉 제어 주기 = 자세 발행 주기 = IMU 100Hz에 자동으로 동기화된다.
 //
 //  출력 채널 배치 : [0]=좌 서보, [1]=우 서보, [2]=요 서보, [3]=꼬리 BLDC 스로틀
+//
+//  ※ 요 제어 없음 (2026-09-14, 운용자 결정): 요 서보 [2] 는 항상 1500(중앙) 고정이다.
+//     조종기 요 스틱(/rc/command z)과 시나리오 요 목표(/auto/command z)는 읽지 않고,
+//     헤딩 오차로 서보를 움직이는 요 PID 도 없다. 좌우 지느러미 믹싱은 원래 롤·피치만
+//     쓰므로 영향이 없다. 되살릴 때는 git 이력에서 kp_yaw 파라미터 시절을 볼 것 —
+//     그때 요 오차가 ±180 경계를 감싸지 않던 결함도 같이 고쳐야 한다.
 // =============================================================================
 
 #include <rclcpp/rclcpp.hpp>
@@ -47,7 +53,6 @@ public:
                        // ※ 벤치용 정적 배율이다 — 물에서 출렁이면 낮추는 게 §5 튜닝.
                        kp_r_(8.75f), ki_r_(0.0f), kd_r_(0.0f),
                        kp_p_(8.75f), ki_p_(0.0f), kd_p_(0.0f),
-                       kp_y_(1.2f), ki_y_(0.0f), kd_y_(0.0f),
                        i_limit_(300.0f),                       // 적분 와인드업 상한 (ki=0인 지금은 무효)
                        // 서보 방향: 우측 지느러미는 몸 반대편에 **거울상으로 장착**돼
                        // 같은 PWM 증가가 물리적으로 반대 회전이 된다. 실측(2026-08-26):
@@ -64,7 +69,7 @@ public:
                        // 에서 양쪽이 반대로 벌어져 되돌렸다. **수동에서 보이던 이상은 이
                        // 값이 아니라 스틱 롤/피치 스왑이 원인이었다** (swap_rc_rp_ 참조) —
                        // 수동만 보고 이 값을 만지면 AUTO 가 깨진다. 판정은 AUTO 로 할 것.
-                       servo_rev_l_(false), servo_rev_r_(true), servo_rev_y_(false),
+                       servo_rev_l_(false), servo_rev_r_(true),
                        // 축 부호. 피치는 IMU 규약이 항공과 반대(양수 pitch = 기수 아래)라
                        // 뒤집힐 소지가 상시 있다 — 벤치에서 지느러미를 보고 확정할 것.
                        invert_pitch_(false), invert_roll_(false),
@@ -77,13 +82,13 @@ public:
                        // 스틱 데드밴드: 실측(45초 정지)에서 roll 스틱이 중립인데 −12까지
                        // 방황했고(트림 오프셋+잡음), 스로틀이 0→28 스파이크를 냈다.
                        rc_deadband_(15), throttle_deadband_(40),
-                       err_sum_roll_(0.0f), err_sum_pitch_(0.0f), err_sum_yaw_(0.0f),
-                       prev_err_roll_(0.0f), prev_err_pitch_(0.0f), prev_err_yaw_(0.0f),
-                       robot_roll_(0.0f), robot_pitch_(0.0f), robot_yaw_(0.0f),
+                       err_sum_roll_(0.0f), err_sum_pitch_(0.0f),
+                       prev_err_roll_(0.0f), prev_err_pitch_(0.0f),
+                       robot_roll_(0.0f), robot_pitch_(0.0f),
                        // rc_throttle_를 -9999(두절 센티넬)로 시작 -> 첫 조종기 패킷이
                        // 도착하기 전까지는 페일세이프 상태로 묶어둔다.
-                       rc_roll_(0), rc_pitch_(0), rc_yaw_(0), rc_throttle_(-9999),
-                       auto_roll_(0), auto_pitch_(0), auto_yaw_(0), auto_throttle_(1000),
+                       rc_roll_(0), rc_pitch_(0), rc_throttle_(-9999),
+                       auto_roll_(0), auto_pitch_(0), auto_throttle_(1000),
                        is_auto_mode_(false),
                        current_rpm_(0),
                        failsafe_timeout_(5.0),                 // 조종기 무수신 허용 시간(초)
@@ -99,13 +104,9 @@ public:
         kp_p_ = (float)this->declare_parameter<double>("kp_pitch", (double)kp_p_);
         ki_p_ = (float)this->declare_parameter<double>("ki_pitch", (double)ki_p_);
         kd_p_ = (float)this->declare_parameter<double>("kd_pitch", (double)kd_p_);
-        kp_y_ = (float)this->declare_parameter<double>("kp_yaw",   (double)kp_y_);
-        ki_y_ = (float)this->declare_parameter<double>("ki_yaw",   (double)ki_y_);
-        kd_y_ = (float)this->declare_parameter<double>("kd_yaw",   (double)kd_y_);
         i_limit_ = (float)this->declare_parameter<double>("i_limit", (double)i_limit_);
         servo_rev_l_ = this->declare_parameter<bool>("servo_reverse_left",  servo_rev_l_);
         servo_rev_r_ = this->declare_parameter<bool>("servo_reverse_right", servo_rev_r_);
-        servo_rev_y_ = this->declare_parameter<bool>("servo_reverse_yaw",   servo_rev_y_);
         // 축 부호 — 서보 반전과 목적이 다르다. 믹싱 주석의 1)/2) 구분을 볼 것.
         invert_pitch_ = this->declare_parameter<bool>("invert_pitch", invert_pitch_);
         invert_roll_  = this->declare_parameter<bool>("invert_roll",  invert_roll_);
@@ -121,11 +122,13 @@ public:
             std::bind(&PidControlNode::on_param_change, this, std::placeholders::_1));
 
         RCLCPP_INFO(this->get_logger(),
-            "=== [PID Control] 게인: roll %.2f/%.2f/%.2f  pitch %.2f/%.2f/%.2f  yaw %.2f/%.2f/%.2f (kp/ki/kd) ===",
-            kp_r_, ki_r_, kd_r_, kp_p_, ki_p_, kd_p_, kp_y_, ki_y_, kd_y_);
+            "=== [PID Control] 게인: roll %.2f/%.2f/%.2f  pitch %.2f/%.2f/%.2f (kp/ki/kd) ===",
+            kp_r_, ki_r_, kd_r_, kp_p_, ki_p_, kd_p_);
         RCLCPP_INFO(this->get_logger(),
-            "=== [PID Control] 서보 반전: 좌 %d / 우 %d / 요 %d  스틱 데드밴드: rpy %d, 스로틀 %d ===",
-            servo_rev_l_, servo_rev_r_, servo_rev_y_, rc_deadband_, throttle_deadband_);
+            "=== [PID Control] 요 제어 없음: 요 서보 1500 고정, 요 스틱·시나리오 요 목표 무시 (2026-09-14) ===");
+        RCLCPP_INFO(this->get_logger(),
+            "=== [PID Control] 서보 반전: 좌 %d / 우 %d  스틱 데드밴드: rp %d, 스로틀 %d ===",
+            servo_rev_l_, servo_rev_r_, rc_deadband_, throttle_deadband_);
         RCLCPP_INFO(this->get_logger(),
             "=== [PID Control] 축 부호 반전: 피치 %d / 롤 %d  (서보 반전과 다른 것 — 축 하나만 뒤집는다) ===",
             invert_pitch_, invert_roll_);
@@ -170,7 +173,7 @@ private:
         }
 
         robot_pitch_ = msg->y;
-        robot_yaw_ = msg->z;
+        // msg->z(yaw)는 쓰지 않는다 — 요 제어 없음 (2026-09-14)
         calculate_pid_control();   // 자세가 갱신될 때마다 즉시 제어 1주기 실행
     }
 
@@ -204,7 +207,8 @@ private:
                 rc_roll_  = static_cast<int16_t>(msg->x);
                 rc_pitch_ = static_cast<int16_t>(msg->y);
             }
-            rc_yaw_ = static_cast<int16_t>(msg->z);
+            // msg->z(요 스틱)는 읽지 않는다 — 요 제어 없음 (2026-09-14).
+            // 원본은 data_logger 가 CSV RC_Y 열에 그대로 남긴다.
             rc_throttle_ = incoming_throttle;
             last_valid_rc_time_ = this->now();
         }
@@ -213,7 +217,7 @@ private:
     void auto_command_callback(const geometry_msgs::msg::Quaternion::SharedPtr msg) {
         auto_roll_ = static_cast<int16_t>(msg->x);
         auto_pitch_ = static_cast<int16_t>(msg->y);
-        auto_yaw_ = static_cast<int16_t>(msg->z);
+        // msg->z(요 목표)는 읽지 않는다 — 요 제어 없음 (2026-09-14)
         auto_throttle_ = static_cast<int16_t>(msg->w);
     }
 
@@ -232,7 +236,6 @@ private:
             const std::string &n = prm.get_name();
             if (n == "servo_reverse_left")  { servo_rev_l_ = prm.as_bool(); RCLCPP_WARN(this->get_logger(), "[PID Control] 서보 반전 변경: 좌 = %d", servo_rev_l_); continue; }
             if (n == "servo_reverse_right") { servo_rev_r_ = prm.as_bool(); RCLCPP_WARN(this->get_logger(), "[PID Control] 서보 반전 변경: 우 = %d", servo_rev_r_); continue; }
-            if (n == "servo_reverse_yaw")   { servo_rev_y_ = prm.as_bool(); RCLCPP_WARN(this->get_logger(), "[PID Control] 서보 반전 변경: 요 = %d", servo_rev_y_); continue; }
             if (n == "invert_pitch")        { invert_pitch_ = prm.as_bool(); RCLCPP_WARN(this->get_logger(), "[PID Control] 축 부호 변경: 피치 반전 = %d", invert_pitch_); continue; }
             if (n == "invert_roll")         { invert_roll_  = prm.as_bool(); RCLCPP_WARN(this->get_logger(), "[PID Control] 축 부호 변경: 롤 반전 = %d",  invert_roll_);  continue; }
             if (n == "swap_rc_roll_pitch")  { swap_rc_rp_   = prm.as_bool(); RCLCPP_WARN(this->get_logger(), "[PID Control] 수동 스틱 롤<->피치 스왑 = %d", swap_rc_rp_); continue; }
@@ -247,9 +250,6 @@ private:
             else if (n == "kp_pitch") kp_p_ = v;
             else if (n == "ki_pitch") { ki_p_ = v; err_sum_pitch_ = 0.0f; }
             else if (n == "kd_pitch") kd_p_ = v;
-            else if (n == "kp_yaw")   kp_y_ = v;
-            else if (n == "ki_yaw")   { ki_y_ = v; err_sum_yaw_   = 0.0f; }
-            else if (n == "kd_yaw")   kd_y_ = v;
             else if (n == "i_limit")  i_limit_ = v;
             else continue;
             RCLCPP_WARN(this->get_logger(), "[PID Control] 게인 변경: %s = %.3f", n.c_str(), v);
@@ -298,7 +298,7 @@ private:
         auto motor_output_msg = std_msgs::msg::UInt16MultiArray();
         motor_output_msg.data.resize(4);
 
-        float target_roll, target_pitch, target_yaw;
+        float target_roll, target_pitch;
         uint16_t active_throttle;
 
         // ---- 목표값 소스 선택 (자동이면 시나리오, 수동이면 조종기) ----
@@ -306,13 +306,12 @@ private:
             // 0.1도 단위 정수 -> 실제 각도(도)
             target_roll = auto_roll_ * 0.1f;
             target_pitch = auto_pitch_ * 0.1f;
-            target_yaw = auto_yaw_ * 0.1f;
             active_throttle = constrain_pwm(auto_throttle_);   // 시나리오는 이미 PWM 단위로 준다
         } else {
             // 스틱 데드밴드 — **MANUAL 분기에만** 둔다. AUTO 경로(auto_*)에 새면 시나리오
             // 명령이 깎이고, uart_bridge 에서 깎으면 data_logger 의 원시 스틱 기록이
             // 사라져 오늘 같은 잡음 진단이 불가능해진다. 여기가 유일하게 옳은 자리다.
-            // roll/pitch/yaw 는 소프트(재중심): 경계 불연속 없이 중심 부근 미세 트림을
+            // roll/pitch 는 소프트(재중심): 경계 불연속 없이 중심 부근 미세 트림을
             // 지킨다. 최대 목표각이 25.5°→24.0° 로 주는 것은 무시한다.
             auto soft_db = [this](int16_t st) -> int16_t {
                 if (st >  rc_deadband_) return (int16_t)(st - rc_deadband_);
@@ -331,7 +330,6 @@ private:
             // 근본 수정은 조종기의 map() 방향이고, 그쪽을 고치면 이 값을 false 로.
             target_roll  = (rc_inv_roll_  ? -1.0f : 1.0f) * soft_db(rc_roll_)  * 0.1f;
             target_pitch = (rc_inv_pitch_ ? -1.0f : 1.0f) * soft_db(rc_pitch_) * 0.1f;
-            target_yaw   = soft_db(rc_yaw_)   * 0.1f;
             // 스로틀은 하드 데드밴드: "의도적 입력 전까지 ESC 는 정확히 1000" 이라는
             // 안전 속성이 연속성보다 중요하다. −9999 센티넬은 위 페일세이프가 이미
             // 걸렀으므로 여기 도달한 rc_throttle_ 은 실제 스틱 값이다.
@@ -346,12 +344,11 @@ private:
         //       dt를 게인에 흡수시킨 구현이며, I항은 단순 누산 / D항은 단순 차분이다.
         float err_roll = target_roll - robot_roll_;
         float err_pitch = target_pitch - robot_pitch_;
-        float err_yaw = target_yaw - robot_yaw_;
 
         // 자세값이 NaN이면(asinf 이상·센서 결함 등) 여기서 적분/미분 상태(err_sum_, prev_err_)에
         // NaN이 스며 재시작 전까지 영구 오염되는 것을 막는다. 상태를 건드리지 않고 안전
         // 출력(서보 중립, 스로틀 유지) 후 반환한다 (N6). 자세 복구 시 깨끗하게 재개된다.
-        if (std::isnan(err_roll) || std::isnan(err_pitch) || std::isnan(err_yaw)) {
+        if (std::isnan(err_roll) || std::isnan(err_pitch)) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                 "[PID Control] 자세값 NaN 감지. 이번 주기 서보 중립 출력 (적분 상태 보존).");
             motor_output_msg.data[0] = 1500;
@@ -365,7 +362,6 @@ private:
         // I항: 오차 누산
         err_sum_roll_ += err_roll;
         err_sum_pitch_ += err_pitch;
-        err_sum_yaw_ += err_yaw;
 
         // 안티 와인드업: 누산값을 ±i_limit_로 잘라 적분항이 폭주하지 않게 한다.
         // (제어가 오래 포화 상태에 머물 때 적분이 무한정 커져 복귀가 늦어지는 현상 방지)
@@ -375,22 +371,16 @@ private:
         if (err_sum_pitch_ > i_limit_) err_sum_pitch_ = i_limit_;
         else if (err_sum_pitch_ < -i_limit_) err_sum_pitch_ = -i_limit_;
 
-        if (err_sum_yaw_ > i_limit_) err_sum_yaw_ = i_limit_;
-        else if (err_sum_yaw_ < -i_limit_) err_sum_yaw_ = -i_limit_;
-
         // D항: 직전 주기 대비 오차 변화량
         float d_roll = err_roll - prev_err_roll_;
         float d_pitch = err_pitch - prev_err_pitch_;
-        float d_yaw = err_yaw - prev_err_yaw_;
 
         prev_err_roll_ = err_roll;
         prev_err_pitch_ = err_pitch;
-        prev_err_yaw_ = err_yaw;
 
         // 축별 제어 출력 u = P + I + D
         float u_roll = (kp_r_ * err_roll) + (ki_r_ * err_sum_roll_) + (kd_r_ * d_roll);
         float u_pitch = (kp_p_ * err_pitch) + (ki_p_ * err_sum_pitch_) + (kd_p_ * d_pitch);
-        float u_yaw = (kp_y_ * err_yaw) + (ki_y_ * err_sum_yaw_) + (kd_y_ * d_yaw);
 
         // ---- 모터 믹싱 ----
         // 좌우 가슴지느러미 서보를 차동 구동한다:
@@ -416,13 +406,11 @@ private:
         float r_term = invert_roll_  ? -u_roll  : u_roll;
         float d_left  = p_term + r_term;
         float d_right = p_term - r_term;
-        float d_yaw_s = u_yaw;
         if (servo_rev_l_) d_left  = -d_left;
         if (servo_rev_r_) d_right = -d_right;
-        if (servo_rev_y_) d_yaw_s = -d_yaw_s;
         motor_output_msg.data[0] = constrain_servo(1500 + d_left);    // 좌 서보
         motor_output_msg.data[1] = constrain_servo(1500 + d_right);   // 우 서보
-        motor_output_msg.data[2] = constrain_servo(1500 + d_yaw_s);   // 요(방향) 서보
+        motor_output_msg.data[2] = 1500;                              // 요 서보: 중앙 고정 (요 제어 없음, 2026-09-14)
         motor_output_msg.data[3] = active_throttle;                            // 꼬리 BLDC 추진
 
         if (is_auto_mode_) {
@@ -434,22 +422,21 @@ private:
         motor_pub_->publish(motor_output_msg);
     }
 
-    // PID 게인 (r=roll, p=pitch, y=yaw)
+    // PID 게인 (r=roll, p=pitch). 요 게인은 없다 — 요 제어 없음 (2026-09-14)
     float kp_r_, ki_r_, kd_r_;
     float kp_p_, ki_p_, kd_p_;
-    float kp_y_, ki_y_, kd_y_;
     float i_limit_;                                          // 적분 누산 한계 (안티 와인드업)
-    bool servo_rev_l_, servo_rev_r_, servo_rev_y_;           // 채널별 장착 방향 반전
+    bool servo_rev_l_, servo_rev_r_;                         // 채널별 장착 방향 반전 (요 서보는 고정이라 없음)
     bool invert_pitch_, invert_roll_;                        // 축별 부호 반전 (믹싱 이전)
     bool swap_rc_rp_;                                        // 수동 스틱 롤<->피치 스왑
     bool rc_inv_roll_, rc_inv_pitch_;                        // 수동 스틱 부호 반전 (AUTO 제외)
     int  rc_deadband_, throttle_deadband_;                   // 스틱 데드밴드 [카운트]
-    float err_sum_roll_, err_sum_pitch_, err_sum_yaw_;       // I항 누산 상태
-    float prev_err_roll_, prev_err_pitch_, prev_err_yaw_;    // D항 계산용 직전 오차
-    float robot_roll_, robot_pitch_, robot_yaw_;             // 현재 자세(측정값)
+    float err_sum_roll_, err_sum_pitch_;                     // I항 누산 상태
+    float prev_err_roll_, prev_err_pitch_;                   // D항 계산용 직전 오차
+    float robot_roll_, robot_pitch_;                         // 현재 자세(측정값)
 
-    int16_t rc_roll_, rc_pitch_, rc_yaw_, rc_throttle_;          // 수동 목표값 (0.1도 / 스틱 raw)
-    int16_t auto_roll_, auto_pitch_, auto_yaw_, auto_throttle_;  // 자동 목표값 (0.1도 / PWM)
+    int16_t rc_roll_, rc_pitch_, rc_throttle_;                   // 수동 목표값 (0.1도 / 스틱 raw)
+    int16_t auto_roll_, auto_pitch_, auto_throttle_;             // 자동 목표값 (0.1도 / PWM)
 
     bool is_auto_mode_;
 

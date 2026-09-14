@@ -70,8 +70,8 @@ I2C sensors ──▶ i2c_driver_node ──▶ /raw/magnetometer ──▶ stat
 | `uart_bridge_node` | `/dev/ttyAMA0` 115200 8N1. Byte-level packet state machine. **Pure pass-through — no scaling, no sign flips.** |
 | `i2c_driver_node` | `/dev/i2c-1`: AK8963 magnetometer (via MPU9250 bypass) + 3× MS5837 behind a TCA9548A mux |
 | `state_estimation_ekf_node` | MEKF filter, button UI, yaw offset, ±5000 mode encoding, mag calibration via `magneto_cal.py`. The "brain" — sole publisher of `/filtered/attitude`. **Pressure left this node on 2026-08-21** — it never entered the filter state; it was inherited furniture from the Mahony migration. |
-| `pid_control_node` | PID + motor mixing. Output `[0]=left servo, [1]=right servo, [2]=yaw servo, [3]=tail BLDC` |
-| `auto_scenario_node` | Time-based trajectory generator for AUTO mode. A scenario is a **step table** (duration + roll/pitch/yaw/thrust per step); adding one means adding a table in `build_steps()`. Six exist (2026-09-03): `straight` (default — level, 40 %, 6 s since 2026-09-14), `dive`, `climb`, `turn` (yaw relative to the heading at entry), `porpoise`, `attitude` (thrust 0, bench servo check). Selected by the `scenario` parameter with `run_sec` / `throttle_pct` / `angle_deg`; **all are latched at AUTO entry**, so a param change applies on the next entry, not mid-run. Every scenario cuts thrust at `run_sec`. |
+| `pid_control_node` | PID + motor mixing. Output `[0]=left servo, [1]=right servo, [2]=yaw servo, [3]=tail BLDC`. **No yaw control since 2026-09-14 (operator decision)**: `[2]` is fixed at 1500 (center), the yaw stick and `/auto/command` z are ignored, and the `kp/ki/kd_yaw` and `servo_reverse_yaw` parameters no longer exist. Roll/pitch mixing never used yaw, so the fins are unaffected. |
+| `auto_scenario_node` | Time-based trajectory generator for AUTO mode. A scenario is a **step table** (duration + roll/pitch/thrust per step); adding one means adding a table in `build_steps()`. Five exist: `straight` (default — level, 40 %, 6 s since 2026-09-14), `dive`, `climb`, `porpoise`, `attitude` (thrust 0, bench servo check). **`turn` was removed with yaw control on 2026-09-14** — naming it is rejected as unknown, and `/auto/command` z is always 0. Selected by the `scenario` parameter with `run_sec` / `throttle_pct` / `angle_deg`; **all are latched at AUTO entry**, so a param change applies on the next entry, not mid-run. Every scenario cuts thrust at `run_sec`. |
 | `rpm_driver_node` | Hall-sensor pulse counting in a worker thread |
 | `hydro_estimator_node` | **Owns pressure end to end** (new 2026-08-21): atmospheric zeroing, `/sensor/pressure_calibrated`, btn1 long-press re-zero, and depth in metres on `/filtered/hydro`. Speed (pitot) is the next stage — those array slots publish NaN today. Observation-only; no control loop consumes it. |
 | `data_logger_node` | 39-column CSV snapshot at 100 Hz — fused attitude **plus raw IMU/mag/pressure and EKF gyro bias + flags** (post-hoc diagnosis; raw mag enables offline recalibration, raw pressure enables offline depth/pitot recomputation). 200 MB per-file rotation, `Time(s)` continuous across files. Schema: `docs/csv_format.md`. |
@@ -100,9 +100,9 @@ matter to them, only direction. **Any new consumer of this topic must convert.**
   `x=roll, y=pitch, z=yaw, w=throttle`. Same for `/auto/command` (`x/y/z` in **0.1°**, `w` in **PWM µs**).
   Measured full-stick ranges (2026-08-27): roll −272~+242, pitch −266~+251, **yaw only −85~+86**
   (1/3 the scale of roll/pitch — nRF-side mapping), throttle 0~+1171 (the code's 1171 constant is
-  exact). Sticks map to target angle at ×0.1°/count in `pid_control_node`, so full yaw stick
-  commands only a ±7° heading target — **left as-is by operator decision (2026-08-27)**; the yaw
-  stick is fine-heading-correction only. Don't "fix" the scale without a new operator request.
+  exact). Roll/pitch sticks map to target angle at ×0.1°/count in `pid_control_node`. **The yaw
+  stick is ignored entirely since 2026-09-14** (operator decision — yaw servo fixed at center); it is
+  still logged raw as `RC_Y`. Before that, full yaw stick commanded only a ±7° heading target.
 - `/rc/status` is `Int32MultiArray[5]` = `[btn1, btn2, vbat1×100, vbat2×100, rssi]`. Voltages are
   centivolts — divide by 100.
 - `/sensor/pressure_raw` is `Float32MultiArray[6]`: `[0..2]` pressure (mbar), `[3..5]` temperature (°C).
@@ -254,7 +254,7 @@ Short press = 30 ms–1 s; long press = exactly 3 s (`== 300`, fires once).
 | | Short | Long |
 |---|---|---|
 | btn1 | AUTO/MANUAL toggle | re-zero atmospheric pressure, **in air only** — refused above 5 mbar gauge (**handled by `hydro_estimator_node`** since 2026-08-21; the EKF still detects the 3 s hold, but only to suppress the release from counting as a short press). The in-water q zero is deliberately *not* on this button; call `/hydro/zero_q` for it |
-| btn2 | set current heading as yaw 0 | run `magneto_cal.py` (ellipsoid); long-press again = finish collection early (SIGINT) |
+| btn2 | set current heading as yaw 0 (published attitude only — nothing steers on yaw since 2026-09-14) | run `magneto_cal.py` (ellipsoid); long-press again = finish collection early (SIGINT) |
 
 **btn1+btn2 held together for 3 s = advance the AUTO scenario** (2026-09-03). While either button is
 held, if the other is down on any tick the press is latched as a *combo*: every single-button action is
