@@ -100,9 +100,11 @@ install(DIRECTORY launch
 # 개발 도구 (로봇에 상주하지 않는다. 지자기 보정과 그 검증용)
 #   ros2 run fish_robot_pkg magneto_cal.py
 #   ros2 run fish_robot_pkg verify_spin.py
+#   ros2 run fish_robot_pkg dip_check.py     # 실험 전 복각 점검 (magneto_cal.py 를 import 한다 — 같이 설치)
 install(PROGRAMS
   scripts/magneto_cal.py
   scripts/verify_spin.py
+  scripts/dip_check.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
