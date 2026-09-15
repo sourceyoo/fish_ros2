@@ -71,7 +71,7 @@ I2C sensors ──▶ i2c_driver_node ──▶ /raw/magnetometer ──▶ stat
 | `i2c_driver_node` | `/dev/i2c-1`: AK8963 magnetometer (via MPU9250 bypass) + 3× MS5837 behind a TCA9548A mux |
 | `state_estimation_ekf_node` | MEKF filter, button UI, yaw offset, ±5000 mode encoding, mag calibration via `magneto_cal.py`. The "brain" — sole publisher of `/filtered/attitude`. **Pressure left this node on 2026-08-21** — it never entered the filter state; it was inherited furniture from the Mahony migration. |
 | `pid_control_node` | PID + motor mixing. Output `[0]=left servo, [1]=right servo, [2]=yaw servo, [3]=tail BLDC`. **No yaw control since 2026-09-14 (operator decision)**: `[2]` is fixed at 1500 (center), the yaw stick and `/auto/command` z are ignored, and the `kp/ki/kd_yaw` and `servo_reverse_yaw` parameters no longer exist. Roll/pitch mixing never used yaw, so the fins are unaffected. |
-| `auto_scenario_node` | Time-based trajectory generator for AUTO mode. A scenario is a **step table** (duration + roll/pitch/thrust per step); adding one means adding a table in `build_steps()`. Five exist: `straight` (default — level, 40 %, 6 s since 2026-09-14), `dive`, `climb`, `porpoise`, `attitude` (thrust 0, bench servo check). **`turn` was removed with yaw control on 2026-09-14** — naming it is rejected as unknown, and `/auto/command` z is always 0. Selected by the `scenario` parameter with `run_sec` / `throttle_pct` / `angle_deg`; **all are latched at AUTO entry**, so a param change applies on the next entry, not mid-run. Every scenario cuts thrust at `run_sec`. |
+| `auto_scenario_node` | Time-based trajectory generator for AUTO mode. A scenario is a **step table** (duration + roll/pitch/thrust per step); adding one means adding a table in `build_steps()`. Five exist: `straight` (default — level, 40 %, 4 s since 2026-09-15), `dive`, `climb`, `porpoise`, `attitude` (thrust 0, bench servo check). **`turn` was removed with yaw control on 2026-09-14** — naming it is rejected as unknown, and `/auto/command` z is always 0. Selected by the `scenario` parameter with `run_sec` / `throttle_pct` / `angle_deg` / `start_delay_sec`; **all are latched at AUTO entry**, so a param change applies on the next entry, not mid-run or mid-wait. **AUTO entry waits `start_delay_sec` (default 5 s, since 2026-09-15) before the scenario starts** — thrust 0 and level during the wait, `run_sec` counts from the end of the wait, and leaving AUTO during the wait cancels it. Every scenario cuts thrust at `run_sec`. |
 | `rpm_driver_node` | Hall-sensor pulse counting in a worker thread |
 | `hydro_estimator_node` | **Owns pressure end to end** (new 2026-08-21): atmospheric zeroing, `/sensor/pressure_calibrated`, btn1 long-press re-zero, and depth in metres on `/filtered/hydro`. Speed (pitot) is the next stage — those array slots publish NaN today. Observation-only; no control loop consumes it. |
 | `data_logger_node` | 39-column CSV snapshot at 100 Hz — fused attitude **plus raw IMU/mag/pressure and EKF gyro bias + flags** (post-hoc diagnosis; raw mag enables offline recalibration, raw pressure enables offline depth/pitot recomputation). 200 MB per-file rotation, `Time(s)` continuous across files. Schema: `docs/csv_format.md`. |
@@ -243,6 +243,17 @@ upper clamp (covariance adjusts trust). §1.3.
   measuring *worse than no calibration*, so it looked restorable but would have made things worse.)
 - **A bad mag vector corrupted Mahony's roll/pitch** (5.0°/1.7° measured), not just yaw; the EKF's
   1-D horizontal yaw update is structurally immune (§5.1, §5.2).
+- **The dip reference is bootstrapped from the first mag sample at boot, wherever the robot sits**
+  (2026-09-14). The absolute check vs 143° only logs (ERROR above 30°) — the EKF keeps the wrong
+  reference and its ±15° gate then **rejects the correct readings** once the robot is moved: the 20:17
+  boot on a disturbed spot (|m| 67.9 µT vs ~38 clean) set 175.8°, and the rejected samples' median was
+  144.3°. Boot the service away from steel/magnets and run `scripts/dip_check.py` before experiments;
+  a wrong reference is fixed by restarting on a clean spot, not by recalibrating. The same day's tumble
+  on that spot read dip 168.5°; one clean boot then gave 142.1°, but **on 2026-09-15 the dip turned out
+  pose-dependent** — upright 139°, lying right side down 122–124°, left side down 140–145° — and the EKF
+  rejected the mag for minutes while the robot lay still on its right side. A good calibration holds the
+  dip within a few degrees in every pose, so that 09-14 calibration is not good: recalibrate on a clean
+  spot. A single clean-boot dip cannot validate a calibration; check several poses with `dip_check.py`.
 - **A hand-held spin cannot validate heading better than ~3°** — the residual sine is the ROOM
   (spatial field gradient), not the robot, and the calibration model is at its limit: do not re-fit
   it over a ~3° residual (§4.4, §4.6).
