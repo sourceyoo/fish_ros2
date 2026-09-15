@@ -26,11 +26,15 @@
 //     ros2 param set /auto_scenario_node run_sec 5.0
 //     ros2 param set /auto_scenario_node throttle_pct 30.0
 //     ros2 param set /auto_scenario_node angle_deg 15.0
+//     ros2 param set /auto_scenario_node start_delay_sec 5.0    # 진입 후 대기(초), 0.0 = 즉시
 //
 //  **바뀐 값은 다음 AUTO 진입부터 적용된다** (달리는 도중에 궤적이 갈아엎히면
 //  물속에서 무슨 일이 일어난 건지 사후에 못 가린다). btn1 로 나갔다 들어오면 된다.
 //
-//  공통 규칙 두 가지:
+//  공통 규칙 세 가지:
+//    · **AUTO 에 들어가면 start_delay_sec(기본 5초) 동안 기다렸다가 시작한다** (2026-09-15).
+//      기다리는 동안은 추력 0 으로 수평만 지시하고, run_sec 은 대기가 끝난 순간부터 센다.
+//      대기 중 MANUAL 로 나가면 취소되고, 다시 들어오면 처음부터 기다린다.
 //    · 어떤 시나리오든 **run_sec 초가 지나면 추력을 끊고 수평으로 정지**한다.
 //      단계표가 그보다 짧으면 표를 처음부터 되풀이한다(왕복 패턴이 이렇게 나온다).
 //    · 단계의 추력 -1 은 "throttle_pct 를 쓴다"는 뜻이다. 운용자가 안전 추력을
@@ -84,9 +88,14 @@ public:
     {
         // ── 파라미터 (기본값의 진실원은 여기 한 곳) ────────────────────────
         scenario_     = this->declare_parameter<std::string>("scenario", "straight");
-        run_sec_      = this->declare_parameter<double>("run_sec", 6.0);
+        run_sec_      = this->declare_parameter<double>("run_sec", 4.0);
         throttle_pct_ = this->declare_parameter<double>("throttle_pct", 40.0);
         angle_deg_    = this->declare_parameter<double>("angle_deg", 15.0);
+        start_delay_sec_ = this->declare_parameter<double>("start_delay_sec", 5.0);
+        if (start_delay_sec_ < 0.0) {
+            RCLCPP_WARN(this->get_logger(), "[AUTO] start_delay_sec %.1f 는 음수라 0 으로 둡니다", start_delay_sec_);
+            start_delay_sec_ = 0.0;
+        }
         combo_list_   = parse_list(this->declare_parameter<std::string>("combo_list", "straight,dive"));
 
         param_cb_ = this->add_on_set_parameters_callback(
@@ -117,19 +126,29 @@ public:
                     } else if (n == "run_sec")      run_sec_      = p.as_double();
                     else if (n == "throttle_pct")   throttle_pct_ = p.as_double();
                     else if (n == "angle_deg")      angle_deg_    = p.as_double();
+                    else if (n == "start_delay_sec") {
+                        const double v = p.as_double();
+                        if (v < 0.0) {
+                            r.successful = false;
+                            r.reason = "start_delay_sec 는 0 이상이어야 합니다 (0.0 = 진입 즉시 시작)";
+                            RCLCPP_ERROR(this->get_logger(), "[AUTO] %s", r.reason.c_str());
+                            continue;
+                        }
+                        start_delay_sec_ = v;
+                    }
                     else continue;
 
                     RCLCPP_WARN(this->get_logger(),
-                        "[AUTO] %s 변경 -> 현재 설정: %s / %.1f초 / 추력 %.0f%% / 각도 %.1f도"
+                        "[AUTO] %s 변경 -> 현재 설정: %s / 대기 %.1f초 / %.1f초 / 추력 %.0f%% / 각도 %.1f도"
                         "  (**다음 AUTO 진입부터 적용**)",
-                        n.c_str(), scenario_.c_str(), run_sec_, throttle_pct_, angle_deg_);
+                        n.c_str(), scenario_.c_str(), start_delay_sec_, run_sec_, throttle_pct_, angle_deg_);
                 }
                 return r;
             });
 
         RCLCPP_INFO(this->get_logger(),
-            "=== [Auto Scenario] 시나리오 '%s' / %.1f초 / 추력 %.0f%% / 각도 %.1f도 ===",
-            scenario_.c_str(), run_sec_, throttle_pct_, angle_deg_);
+            "=== [Auto Scenario] 시나리오 '%s' / 진입 후 대기 %.1f초 / %.1f초 / 추력 %.0f%% / 각도 %.1f도 ===",
+            scenario_.c_str(), start_delay_sec_, run_sec_, throttle_pct_, angle_deg_);
 
         auto_cmd_pub_ = this->create_publisher<geometry_msgs::msg::Quaternion>("/auto/command", 10);
 
@@ -220,23 +239,25 @@ private:
         //    이 처리가 없으면 노드 기동 시각부터 세게 되어, 자동 모드로 들어가자마자
         //    시나리오가 이미 끝난 상태로 시작한다.
         if (is_auto_mode_ && !prev_auto_mode_) {
-            scenario_start_time_ = this->now();
-            run_done_logged_     = false;
-            // **진입 순간의 설정을 통째로 잠근다.** 달리는 도중 파라미터가 바뀌어도
-            // 이번 주행은 진입 때 값으로 끝까지 간다 — 사후 분석에서 "무엇을 지시했나"가
-            // 한 값으로 확정되게 하기 위해서다.
-            active_scenario_ = scenario_;
-            active_run_sec_  = run_sec_;
-            active_thr_pct_  = throttle_pct_;
-            active_steps_    = build_steps();
+            auto_entry_time_ = this->now();
+            run_started_     = false;
+            run_done_logged_ = false;
+            // **진입 순간의 설정을 통째로 잠근다.** 대기 중이든 달리는 도중이든 파라미터가
+            // 바뀌어도 이번 주행은 진입 때 값으로 끝까지 간다 — 사후 분석에서 "무엇을
+            // 지시했나"가 한 값으로 확정되게 하기 위해서다. 대기 시간도 같이 잠근다.
+            active_scenario_  = scenario_;
+            active_run_sec_   = run_sec_;
+            active_thr_pct_   = throttle_pct_;
+            active_delay_sec_ = start_delay_sec_;
+            active_steps_     = build_steps();
 
             double table_sec = 0.0;
             for (const auto &s : active_steps_) table_sec += s.sec;
 
             RCLCPP_WARN(this->get_logger(), "=========================================");
             RCLCPP_WARN(this->get_logger(),
-                "[AUTO SCENARIO] 시작! '%s'  %.1f초  추력 %.0f%%",
-                active_scenario_.c_str(), active_run_sec_, active_thr_pct_);
+                "[AUTO SCENARIO] AUTO 진입 — %.1f초 뒤 '%s' 시작  (%.1f초, 추력 %.0f%%)",
+                active_delay_sec_, active_scenario_.c_str(), active_run_sec_, active_thr_pct_);
             if (table_sec > active_run_sec_ + 1e-6) {
                 RCLCPP_WARN(this->get_logger(),
                     "[AUTO SCENARIO] 주의: 단계표가 %.1f초인데 run_sec 은 %.1f초 — "
@@ -246,10 +267,31 @@ private:
         }
 
         if (is_auto_mode_) {
-            const double elapsed = (this->now() - scenario_start_time_).seconds();
+            // run_sec 은 **대기가 끝난 순간부터** 센다. 대기 중에는 elapsed 가 음수다.
+            const double since_entry = (this->now() - auto_entry_time_).seconds();
+            const double elapsed     = since_entry - active_delay_sec_;
 
-            if (elapsed < active_run_sec_ && !active_steps_.empty()) {
-                // 2. 단계표에서 지금 단계를 고른다. 표가 run_sec 보다 짧으면 되풀이한다.
+            if (elapsed >= 0.0 && !run_started_) {
+                run_started_ = true;
+                RCLCPP_WARN(this->get_logger(), "=========================================");
+                RCLCPP_WARN(this->get_logger(),
+                    "[AUTO SCENARIO] 시작! '%s'  %.1f초  추력 %.0f%%",
+                    active_scenario_.c_str(), active_run_sec_, active_thr_pct_);
+                RCLCPP_WARN(this->get_logger(), "=========================================");
+            }
+
+            if (elapsed < 0.0) {
+                // 2. 시작 대기 — 추력 0, 수평. 물에 넣고 손을 뗄 시간을 준다.
+                //    대기 중 btn1 로 MANUAL 에 나가면 취소되고, 다시 들어오면 처음부터 기다린다.
+                cmd_msg.x = 0.0;
+                cmd_msg.y = 0.0;
+                cmd_msg.z = 0.0;
+                cmd_msg.w = 1000.0;
+                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                    "[AUTO SCENARIO] 대기 중 — '%s' 시작까지 %.0f초",
+                    active_scenario_.c_str(), std::ceil(-elapsed));
+            } else if (elapsed < active_run_sec_ && !active_steps_.empty()) {
+                // 3. 단계표에서 지금 단계를 고른다. 표가 run_sec 보다 짧으면 되풀이한다.
                 double table_sec = 0.0;
                 for (const auto &s : active_steps_) table_sec += s.sec;
                 double u = (table_sec > 0.0) ? std::fmod(elapsed, table_sec) : 0.0;
@@ -260,7 +302,7 @@ private:
                     u -= s.sec;
                 }
 
-                // 3. 단위 규약: x/y 는 0.1도 단위(PID 가 *0.1f 로 환산), w 는 PWM(us).
+                // 4. 단위 규약: x/y 는 0.1도 단위(PID 가 *0.1f 로 환산), w 는 PWM(us).
                 //    z(요)는 항상 0 — 요 제어 없음 (2026-09-14), PID 도 읽지 않는다.
                 const double thr_pct = (cur->thr_pct < 0.0) ? active_thr_pct_ : cur->thr_pct;
                 cmd_msg.x = cur->roll  * 10.0;
@@ -273,7 +315,7 @@ private:
                     active_scenario_.c_str(), elapsed, active_run_sec_,
                     cmd_msg.x * 0.1, cmd_msg.y * 0.1, thr_pct);
             } else {
-                // 4. 주행 종료 — 추력을 끊고 수평을 계속 지시한다.
+                // 5. 주행 종료 — 추력을 끊고 수평을 계속 지시한다.
                 //    (자세 지시를 놓으면 목표가 사라지는 게 아니라 마지막 값이 남으므로
                 //     명시적으로 수평을 계속 준다.)
                 cmd_msg.x = 0.0;
@@ -305,19 +347,20 @@ private:
     bool is_auto_mode_;
     bool prev_auto_mode_;      // 상태 전이 판별용 과거 상태
     bool run_done_logged_;     // 종료 로그를 한 번만 찍기 위한 래치
+    bool run_started_ = false; // 대기 끝 "시작!" 로그를 한 번만 찍기 위한 래치
 
     // 설정값 (파라미터, 언제든 바뀔 수 있다)
     std::string scenario_;
-    double run_sec_, throttle_pct_, angle_deg_;
+    double run_sec_, throttle_pct_, angle_deg_, start_delay_sec_;
     std::vector<std::string> combo_list_;   // 조합 누름이 순환할 시나리오 목록
     size_t combo_idx_ = 0;
 
     // 이번 주행에 잠긴 값 (진입 순간 복사)
     std::string active_scenario_;
-    double active_run_sec_ = 3.0, active_thr_pct_ = 20.0;
+    double active_run_sec_ = 3.0, active_thr_pct_ = 20.0, active_delay_sec_ = 5.0;
     std::vector<Step> active_steps_;
 
-    rclcpp::Time scenario_start_time_;
+    rclcpp::Time auto_entry_time_;   // AUTO 진입 시각 — 대기와 주행 시간 모두 여기서 센다
 
     rclcpp::Publisher<geometry_msgs::msg::Quaternion>::SharedPtr auto_cmd_pub_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3>::SharedPtr attitude_sub_;
