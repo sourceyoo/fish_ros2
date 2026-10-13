@@ -14,7 +14,7 @@ def generate_launch_description():
             respawn_delay=2.0
         ),
 
-        # 2. I2C 드라이버 노드 (지자기 및 3채널 압력 센서 전송망)
+        # 2. I2C 드라이버 노드 (지자기·3채널 압력 + MPU9250 6축 감시 /raw/imu_mpu9250, 2026-09-16)
         Node(
             package='fish_robot_pkg',
             executable='i2c_driver_node',
@@ -100,7 +100,7 @@ def generate_launch_description():
         ),
 
         # 8. 수심/속도 추정 노드 — 압력 3채널에서 수심(현재)과 전진 속도(다음 단계)
-        #    출력: /filtered/hydro [depth, speed, q, q_raw, dP_hydro, static, pitch, flags]
+        #    출력: /filtered/hydro [depth, speed, q, q_raw, dP_hydro, static, pitch, flags, + 대기창 영점 7칸(2026-09-16)]
         #    서비스: /hydro/zero_atm (대기압 영점 재포착)
         #
         #    ※ 관측 전용이다 — 어떤 제어 루프도 아직 /filtered/hydro 를 구독하지 않는다.

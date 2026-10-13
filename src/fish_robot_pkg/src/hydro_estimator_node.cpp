@@ -6,11 +6,13 @@
 //         다만 속도의 절대 기준(q_offset)과 배율(speed_k)은 **물속 실측으로만** 정해진다 —
 //         그전까지 속도는 상대값이고, 플래그와 기동 경고가 그것을 알린다.
 //
-//   [입력] /sensor/pressure_raw    (Float32MultiArray[6]) 절대압 3채널[mbar] + 온도 3채널[°C], ~11Hz
+//   [입력] /sensor/pressure_raw    (Float32MultiArray[6]) 절대압 3채널[mbar] + 온도 3채널[°C], 약 19Hz (2026-09-19, 종전 11Hz)
 //          /filtered/attitude_ekf (Vector3)              순수 자세[도] — 100Hz, 링버퍼로 지연 보정
 //          /rc/status             (Int32MultiArray[5])   버튼 (btn1 롱프레스 = 대기압 재영점)
 //          /sensor/tail_rpm       (Int32)                포트 배정 뒤바뀜 감시용
-//   [출력] /filtered/hydro             (Float32MultiArray[8]) 아래 배열 규격 참조
+//          /raw/imu_6dof          (Imu)                  자이로 크기[도/초] — 대기창 정지 판정용
+//          /auto/state            (Int32)                0 IDLE/1 WAIT/2 RUN — 대기창 영점의 수집·확정 시점
+//   [출력] /filtered/hydro             (Float32MultiArray[15]) 아래 배열 규격 참조
 //          /sensor/pressure_calibrated (Float32MultiArray[3]) 대기압 영점 제거된 게이지압[mbar]
 //   [서비스] /hydro/zero_atm (std_srvs/Trigger)  대기압 영점 재포착 (공기 중)
 //            /hydro/zero_q   (std_srvs/Trigger)  물속 정지 동압 영점
@@ -94,7 +96,39 @@
 //  ※ i2c_driver_node 의 IIR(현재 우회)을 되살리면 군지연 ~860ms 가 붙어 이 값이
 //    통째로 무의미해진다. 되살릴 때 pressure_lag_ms 를 반드시 다시 정할 것.
 //
-//  ── /filtered/hydro 배열 규격 (8) ──────────────────────────────────────────
+//  ── 대기창 물속 영점 (wet-zero, 2026-09-16) ────────────────────────────────
+//  0913·0914·0915 수조 로그 분석 결과: **공기 중 영점은 입수 뒤 무효다.** 젖으면 채널마다
+//  영점이 다르게 흘러(0915: P0 +0.65 / P1 +0.35 / P2 −0.2 mbar) 정지 상태에서 Speed 가
+//  +0.3~0.4 m/s 남고, 자세 오차가 겹치면 −0.4 m/s 도 나온다. 속도 신호 자체가 작아서
+//  (0.4 m/s = 0.8 mbar, 피치 1도 = 0.30 mbar) 영점 0.3 mbar 가 곧 0.25 m/s 다.
+//
+//  그래서 **AUTO 진입 뒤 꼬리가 돌기 전 대기(start_delay_sec) 동안** 로봇이 조용한 구간의
+//  q 를 그 주행의 영점으로 잡는다. 실행마다 새로 잡는다 — 물에서 꺼냈다 넣으면 영점이 바뀐다.
+//
+//    WAIT 중 매 압력 샘플:  q = q_raw − dP_hydro   (q_offset 은 안 뺀다 — 이 영점이 Δb 까지 흡수)
+//                          still = |수심 변화율| < 5 mm/s  AND  |자이로| 1초 평균 < 5 dps
+//    WAIT → RUN 순간:      ① still 이 연속 still_min_sec(2초) 이상인 구간 중 **가장 늦은** 것의
+//                             q 중앙값 → 영점 (src 1). 늦은 것 = 가장 자리 잡은 상태
+//                          ② 없으면 대기 마지막 fallback_sec(2초)의 중앙값 (src 2)
+//                          ③ 그마저 min_samples(5) 미만이면 영점 0, src 0 (기존 동작과 같음)
+//    이후 (RUN·그 뒤 IDLE): q_wz = q − 영점,  speed_wz = k·sign·sqrt(2|q_wz|/rho)
+//
+//  · 수심 변화율은 최근 1초의 **선형회귀 기울기**다. 단순 차분은 잡음이 28 mm/s 라 못 쓴다.
+//    대기압 영점과 무관하게 절대압 평균의 기울기를 쓰므로 웜업 전에도 판정된다.
+//  · 자이로는 /raw/imu_6dof 의 **원시 도/초**(바이어스 포함)를 그대로 쓴다 — 로그의 GX/GY/GZ
+//    와 같은 값이어야 오프라인 재현이 되기 때문이다. 문턱 5 dps 는 0915 실측(정지 부유
+//    6.2~6.5, 넣는 중 8~9)의 경계값이라 폴백이 잦으면 7 로 완화한다.
+//  · 기존 speed/q(q_offset·LPF·데드밴드)는 **그대로 둔다**(비교용). 새 값은 필터 없이 샘플
+//    그대로 낸다 — 사후 분석이 같은 식을 오프라인으로 돌려 대조하기 위해서다.
+//  · 주기적 재영점은 하지 않는다 — 헤엄치는 중 동압이 영점에 흡수된다.
+//  · 조종기 링크가 물속에서 끊겨 버튼을 누른 뒤 손으로 넣는 구조라 버튼 직후 4~5초는
+//    가라앉는 중(수심 +14~21 mm/s)이다. 대기 5초면 폴백이 잦을 수 있다 — start_delay_sec
+//    10 이 권장값이다 (auto_scenario_node 파라미터).
+//  · 문턱은 wet_zero_* 파라미터로 **재시작 없이** 바꿀 수 있고, WAIT 진입 순간에 잠긴다.
+//  · WAIT 진입 때 이전 영점은 지운다(NaN). 즉 한 행의 영점은 언제나 "그 행이 속한 주행"의 것이다.
+//    대기가 주행 없이 끝나면(MANUAL 로 나감) 버린다 — 적용할 주행이 없다.
+//
+//  ── /filtered/hydro 배열 규격 (15) ─────────────────────────────────────────
 //    [0] depth        [m]     수심. 영점 미포착·정압 전멸이면 NaN
 //    [1] speed        [m/s]   부호 있음. 앞 포트 사망·자세 없음이면 NaN
 //    [2] q            [mbar]  보정·영점 후, 저역통과·데드밴드 적용
@@ -103,6 +137,14 @@
 //    [5] static_gauge [mbar]  살아있는 정압 포트의 게이지압 평균
 //    [6] pitch_used   [도]    **실제로 보간해 쓴 피치** (5~7열 스냅샷과 다르다)
 //    [7] flags        비트    아래 FLAG_* 참조
+//   ── 대기창 물속 영점 (2026-09-16 추가, 위 절 참조) ──
+//    [8]  wz_zero     [mbar]  이번 주행에 적용 중인 대기창 영점. 확정 전엔 NaN, "없음"으로 확정되면 0
+//    [9]  wz_src      0 없음 / 1 정지 구간 / 2 대기 끝 폴백
+//    [10] wz_t0_age   [s]     영점 구간 시작이 지금보다 얼마나 과거인가 (로거가 Time(s) 축으로 환산)
+//    [11] wz_t1_age   [s]     영점 구간 끝. float32 에 epoch 초를 실으면 128초 단위로 뭉개져 나이로 보낸다
+//    [12] wz_still    0/1     WAIT 중 이번 샘플의 정지 판정. WAIT 밖에서는 0
+//    [13] q_wz        [mbar]  (q_raw − dP_hydro) − wz_zero. **필터·데드밴드 없음**, 샘플 그대로
+//    [14] speed_wz    [m/s]   k·sign(q_wz)·sqrt(2|q_wz|/rho). 영점 확정 전엔 NaN
 //  커스텀 메시지를 만들지 않는 프로젝트 관례를 따른다. flags를 float에 싣는 것도
 //  /filtered/ekf_status data[10] 과 같은 방식이다 (float32는 2^24까지 정수 정확).
 // =============================================================================
@@ -112,6 +154,7 @@
 #include <std_msgs/msg/int32_multi_array.hpp>
 #include <std_msgs/msg/int32.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
 #include <algorithm>
@@ -124,8 +167,21 @@
 #include <deque>
 #include <vector>
 
+// 압력 토픽의 실효 주기 [Hz]. i2c_driver_node 의 상태 머신이 정하는 값이고, 여기서는
+// LPF 계수·데드밴드 문턱·수집 시간 안내에 쓴다. **드라이버를 바꾸면 여기도 바꿔야 한다** —
+// 2026-09-19 에 온도를 10사이클에 한 번만 읽도록 바꾸면서 11 -> 약 19.3Hz 가 됐다.
+// 틀리면 조용히 어긋난다: dt 가 틀리면 LPF 시상수가, 이 값이 틀리면 데드밴드 문턱이 밀린다.
+static constexpr double PRESS_HZ = 19.3;
+
 // 배열 인덱스 — 숫자를 코드 여기저기 흩뿌리지 않는다
-enum { H_DEPTH = 0, H_SPEED, H_Q, H_QRAW, H_DPHYDRO, H_STATIC, H_PITCH, H_FLAGS, H_LEN };
+enum { H_DEPTH = 0, H_SPEED, H_Q, H_QRAW, H_DPHYDRO, H_STATIC, H_PITCH, H_FLAGS,
+       // 대기창 물속 영점 (2026-09-16). 기존 8칸 뒤에 덧붙인다 — 열 번호로 읽는 소비자가 안 깨지게
+       H_WZ_ZERO, H_WZ_SRC, H_WZ_T0_AGE, H_WZ_T1_AGE, H_WZ_STILL, H_WZ_Q, H_WZ_SPEED,
+       H_LEN };
+
+// /auto/state 값. auto_scenario_node 가 정의하고 data_logger_node 도 같은 숫자로 읽는다 —
+// 바꾸면 세 파일을 같이 바꿔야 한다 (±5000 모드 규약과 같은 종류의 약속).
+enum { AUTO_STATE_IDLE = 0, AUTO_STATE_WAIT = 1, AUTO_STATE_RUN = 2 };
 
 // 플래그. 앞쪽(0x001~0x020)은 "정상 동작 중"을 켜는 비트, 뒤쪽은 고장 비트다.
 static constexpr uint32_t FLAG_DEPTH_OK   = 0x001;   // 수심 유효
@@ -157,6 +213,8 @@ public:
         last_static_gauge_time_ = rclcpp::Time(0, 0, this->get_clock()->get_clock_type());
         last_att_time_   = this->now() - rclcpp::Duration::from_seconds(3600.0);   // "아직 없음"
         q_collect_start_ = this->now();
+        last_auto_state_time_ = this->now();
+        wz_t0_ = wz_t1_ = rclcpp::Time(0, 0, this->get_clock()->get_clock_type());
 
         for (int i = 0; i < 3; i++) atm_offset_[i] = NAN;
 
@@ -191,6 +249,17 @@ public:
             "/sensor/tail_rpm", 10,
             std::bind(&HydroEstimatorNode::rpm_callback, this, std::placeholders::_1));
 
+        // 대기창 정지 판정 입력 — 자이로 크기 이력 (100 Hz)
+        imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
+            "/raw/imu_6dof", 50,
+            std::bind(&HydroEstimatorNode::imu_callback, this, std::placeholders::_1));
+
+        // AUTO 대기/주행 상태 (auto_scenario_node, 100 Hz). WAIT 에 들어가면 수집, RUN 으로
+        // 넘어가면 확정. 모드(±5000)만으로는 "대기가 끝난 순간"을 알 수 없어 따로 받는다.
+        auto_state_sub_ = this->create_subscription<std_msgs::msg::Int32>(
+            "/auto/state", 10,
+            std::bind(&HydroEstimatorNode::auto_state_callback, this, std::placeholders::_1));
+
         zero_q_srv_ = this->create_service<std_srvs::srv::Trigger>(
             "/hydro/zero_q",
             std::bind(&HydroEstimatorNode::handle_zero_q, this,
@@ -205,6 +274,49 @@ public:
         // 아예 멈췄을 때 판정 자체가 안 돌아 영원히 침묵한다.
         watchdog_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(500), std::bind(&HydroEstimatorNode::watchdog, this));
+
+        // wet_zero_* 만 재시작 없이 바꿀 수 있다 (WAIT 진입 순간에 잠긴다). 다른 파라미터는
+        // 콜백이 없던 때와 같이 "성공"만 뜨고 먹히지 않는다 — docs/operation.md 7.2.
+        param_cb_ = this->add_on_set_parameters_callback(
+            [this](const std::vector<rclcpp::Parameter> &ps) {
+                rcl_interfaces::msg::SetParametersResult r;
+                r.successful = true;
+                for (const auto &p : ps) {
+                    const auto &n = p.get_name();
+                    if (n.rfind("wet_zero_", 0) != 0) continue;
+                    if (n == "wet_zero_enable") {
+                        wz_enable_ = p.as_bool();
+                    } else if (n == "wet_zero_min_samples") {
+                        if (p.as_int() < 1) {
+                            r.successful = false; r.reason = n + " 은 1 이상이어야 합니다";
+                            RCLCPP_ERROR(this->get_logger(), "[Hydro] %s", r.reason.c_str());
+                            break;
+                        }
+                        wz_min_samples_ = static_cast<int>(p.as_int());
+                    } else {
+                        const double v = p.as_double();
+                        const double lo = (n == "wet_zero_window_sec") ? 0.2 : 0.0;
+                        if (!(v >= lo)) {   // NaN 도 여기서 걸린다
+                            r.successful = false;
+                            r.reason = n + " 은 " + std::to_string(lo) + " 이상이어야 합니다";
+                            RCLCPP_ERROR(this->get_logger(), "[Hydro] %s", r.reason.c_str());
+                            break;
+                        }
+                        if      (n == "wet_zero_still_depth_rate_mm_s") wz_rate_max_      = v;
+                        else if (n == "wet_zero_still_gyro_dps")        wz_gyro_max_      = v;
+                        else if (n == "wet_zero_still_min_sec")         wz_still_min_sec_ = v;
+                        else if (n == "wet_zero_fallback_sec")          wz_fallback_sec_  = v;
+                        else if (n == "wet_zero_window_sec")            wz_window_sec_    = v;
+                        else continue;
+                    }
+                    RCLCPP_WARN(this->get_logger(),
+                        "[Hydro] %s 변경 -> 대기창 영점: %s, 정지 기준 수심변화 < %.1f mm/s & 자이로 < %.1f dps "
+                        "(창 %.1f초), 연속 %.1f초, 폴백 %.1f초, 최소 %d샘플  (**다음 AUTO 진입부터 적용**)",
+                        n.c_str(), wz_enable_ ? "켜짐" : "꺼짐", wz_rate_max_, wz_gyro_max_, wz_window_sec_,
+                        wz_still_min_sec_, wz_fallback_sec_, wz_min_samples_);
+                }
+                return r;
+            });
 
         log_effective_params();
     }
@@ -293,11 +405,23 @@ private:
         q_sigma_     = this->declare_parameter<double>("q_sigma_mbar", 0.189);   // 실측 샘플당
         q_deadband_n_= this->declare_parameter<double>("q_deadband_sigma", 3.0);
         q_offset_max_= this->declare_parameter<double>("q_offset_max_mbar", 10.0);
-        q_window_    = this->declare_parameter<int>("q_zero_window_samples", 33); // ~3초 @11Hz
+        q_window_    = this->declare_parameter<int>("q_zero_window_samples", 58); // ~3초 @19.3Hz (11Hz 시절 33)
         q_spread_max_= this->declare_parameter<double>("q_zero_spread_max_mbar", 0.5);
         min_submerged_ = this->declare_parameter<double>("min_submerged_mbar", 3.0);
-        // 33샘플이 11Hz 면 3초. 30초를 주면 절반이 유실돼도 끝난다.
+        // 58샘플이 19.3Hz 면 3초. 30초를 주면 절반이 유실돼도 끝난다.
         q_collect_timeout_ = this->declare_parameter<double>("q_zero_timeout_sec", 30.0);
+
+        // ---- 대기창 물속 영점 (2026-09-16) — 근거는 파일 머리말 ----
+        // 수치는 0915 수조 로그에서 정했다. 정지 1.5 / 가라앉는 중 14~21 mm/s, 자이로는
+        // 정지 부유 6.2~6.5 / 넣는 중 8~9 dps 의 경계값. 2초는 잡음 σ 0.15 mbar 에서
+        // 22샘플 중앙값이 ±0.05 mbar 가 되는 길이다.
+        wz_enable_        = this->declare_parameter<bool>("wet_zero_enable", true);
+        wz_rate_max_      = this->declare_parameter<double>("wet_zero_still_depth_rate_mm_s", 5.0);
+        wz_gyro_max_      = this->declare_parameter<double>("wet_zero_still_gyro_dps", 5.0);
+        wz_still_min_sec_ = this->declare_parameter<double>("wet_zero_still_min_sec", 2.0);
+        wz_fallback_sec_  = this->declare_parameter<double>("wet_zero_fallback_sec", 2.0);
+        wz_min_samples_   = this->declare_parameter<int>("wet_zero_min_samples", 5);
+        wz_window_sec_    = this->declare_parameter<double>("wet_zero_window_sec", 1.0);   // 변화율·자이로 평균 창
 
         K_ = rho_ * gravity_ / 100.0;
 
@@ -326,7 +450,13 @@ private:
         }
         RCLCPP_INFO(this->get_logger(), "[Hydro]   영점 유효기간: 대기압 %.0f시간(잠정 적재용), q %.0f시간",
                     atm_zero_max_age_ / 3600.0, q_zero_max_age_ / 3600.0);
-        RCLCPP_INFO(this->get_logger(), "[Hydro] 출력: /filtered/hydro [depth, speed, q, q_raw, dP_hydro, static, pitch, flags]");
+        RCLCPP_INFO(this->get_logger(), "[Hydro] 출력: /filtered/hydro [depth, speed, q, q_raw, dP_hydro, static, pitch, flags,"
+                                        " wz_zero, wz_src, wz_t0_age, wz_t1_age, wz_still, q_wz, speed_wz]");
+        RCLCPP_INFO(this->get_logger(),
+                    "[Hydro] 대기창 물속 영점: %s — AUTO 대기(/auto/state=1) 중 정지 구간(수심변화 < %.1f mm/s & "
+                    "자이로 < %.1f dps, 연속 %.1f초)의 q 중앙값. 없으면 마지막 %.1f초 폴백, %d샘플 미만이면 영점 없음",
+                    wz_enable_ ? "켜짐" : "**꺼짐**", wz_rate_max_, wz_gyro_max_, wz_still_min_sec_,
+                    wz_fallback_sec_, wz_min_samples_);
         RCLCPP_INFO(this->get_logger(), "[Hydro]       /sensor/pressure_calibrated (EKF에서 이관 — 발행자는 반드시 1개)");
         RCLCPP_INFO(this->get_logger(), "[Hydro] 재영점: btn1 롱프레스 3초(공기 중에서만), 또는 서비스 /hydro/zero_atm");
         RCLCPP_INFO(this->get_logger(), "[Hydro] q 영점: %s  (물속 재포착: /hydro/zero_q)",
@@ -687,6 +817,168 @@ private:
 
     void rpm_callback(const std_msgs::msg::Int32::SharedPtr msg) { tail_rpm_ = msg->data; }
 
+    // =========================================================================
+    //  대기창 물속 영점 — 입력 이력과 상태 전이
+    // =========================================================================
+    struct TSample  { rclcpp::Time t; double v; };
+    struct WzSample { rclcpp::Time t; double q; bool usable; };
+    static constexpr size_t WZ_BUF_MAX = 4096;   // 19.3 Hz × 3분 남짓. 대기가 이보다 길 일은 없다
+
+    static void trim_old(std::deque<TSample> &buf, const rclcpp::Time &now, double window_sec) {
+        while (!buf.empty() && (now - buf.front().t).seconds() > window_sec) buf.pop_front();
+    }
+
+    // nRF 규약대로 angular_velocity 는 **도/초** 그대로다(REP-103 아님). 문턱도 도/초라
+    // 변환하지 않는다. 바이어스도 빼지 않는다 — 로그의 GX/GY/GZ 와 같은 값이어야
+    // 오프라인 재현이 된다 (z 바이어스는 세션마다 −0.04~−2.2 도/초로 달라 문턱 5 에
+    // 비해 작지 않지만, 문턱 자체가 그 원시값으로 정해졌다).
+    void imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
+        const double x = msg->angular_velocity.x, y = msg->angular_velocity.y, z = msg->angular_velocity.z;
+        const rclcpp::Time t = this->now();
+        gyro_buf_.push_back(TSample{t, std::sqrt(x * x + y * y + z * z)});
+        trim_old(gyro_buf_, t, wz_window_sec_);
+    }
+
+    void auto_state_callback(const std_msgs::msg::Int32::SharedPtr msg) {
+        last_auto_state_time_ = this->now();
+        set_auto_state(msg->data);
+    }
+
+    // 전이만 본다. WAIT 로 들어가면 수집 시작, WAIT 에서 RUN 으로 나가면 확정,
+    // WAIT 에서 그 밖(IDLE)으로 나가면 주행이 없었으니 버린다.
+    void set_auto_state(int s) {
+        if (s == auto_state_) return;
+        const int prev = auto_state_;
+        auto_state_ = s;
+        if (s == AUTO_STATE_WAIT)         wz_begin_wait();
+        else if (prev == AUTO_STATE_WAIT) {
+            if (s == AUTO_STATE_RUN)      wz_decide();
+            else                          wz_cancel();
+        }
+    }
+
+    // 정지 판정. 수심 변화율은 최근 창의 정압 평균을 시간에 선형회귀한 기울기[mm/s],
+    // 자이로는 같은 창의 |ω| 평균[도/초]. 둘 다 있어야 하고 둘 다 문턱 아래여야 정지다.
+    bool wz_is_still(double &rate_mm_s, double &gyro_dps) const {
+        rate_mm_s = NAN; gyro_dps = NAN;
+        if (rate_buf_.size() >= 10) {  // 19.3 Hz 창의 절반 이상 — 샘플 유실에 대한 여유
+            const rclcpp::Time t0 = rate_buf_.front().t;
+            double n = 0.0, sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
+            for (const auto &s : rate_buf_) {
+                const double x = (s.t - t0).seconds(), y = s.v;
+                n += 1.0; sx += x; sy += y; sxx += x * x; sxy += x * y;
+            }
+            const double den = n * sxx - sx * sx;
+            if (den > 1e-9) {
+                const double slope_mbar_s = (n * sxy - sx * sy) / den;
+                rate_mm_s = slope_mbar_s / mbar_per_m_ * 1000.0;   // 1 mbar = 10.23 mm
+            }
+        }
+        if (gyro_buf_.size() >= 10) {   // 100 Hz 창에서 0.1초 이상
+            double sum = 0.0;
+            for (const auto &g : gyro_buf_) sum += g.v;
+            gyro_dps = sum / gyro_buf_.size();
+        }
+        return std::isfinite(rate_mm_s) && std::isfinite(gyro_dps)
+            && std::abs(rate_mm_s) < active_wz_rate_max_ && gyro_dps < active_wz_gyro_max_;
+    }
+
+    void wz_begin_wait() {
+        wz_buf_.clear();
+        // 이전 주행의 영점은 여기서 지운다 — 한 행의 영점은 언제나 그 행이 속한 주행의 것.
+        q_wz_ = std::numeric_limits<double>::quiet_NaN();
+        wz_src_ = 0;
+        wz_have_window_ = false;
+        // 진입 순간의 문턱을 잠근다. 대기 중 바꿔도 이번 판정은 한 기준으로 간다.
+        active_wz_rate_max_      = wz_rate_max_;
+        active_wz_gyro_max_      = wz_gyro_max_;
+        active_wz_still_min_sec_ = wz_still_min_sec_;
+        active_wz_fallback_sec_  = wz_fallback_sec_;
+        active_wz_min_samples_   = wz_min_samples_;
+        if (!wz_enable_) {
+            RCLCPP_INFO(this->get_logger(), "[Hydro] AUTO 대기 시작 — 대기창 영점은 **꺼져 있음** (wet_zero_enable=false)");
+            return;
+        }
+        RCLCPP_INFO(this->get_logger(),
+            "[Hydro] AUTO 대기 시작 — 대기창 물속 영점 수집 (정지 기준: 수심변화 < %.1f mm/s & 자이로 < %.1f dps, "
+            "연속 %.1f초; 없으면 마지막 %.1f초 폴백)",
+            active_wz_rate_max_, active_wz_gyro_max_, active_wz_still_min_sec_, active_wz_fallback_sec_);
+    }
+
+    void wz_cancel() {
+        if (wz_enable_)
+            RCLCPP_INFO(this->get_logger(),
+                "[Hydro] AUTO 대기가 주행 없이 끝남 — 대기창 %zu샘플을 버립니다 (영점 없음)", wz_buf_.size());
+        wz_buf_.clear();
+    }
+
+    // WAIT → RUN 순간. 파일 머리말의 ①②③.
+    void wz_decide() {
+        if (!wz_enable_) return;
+        const size_t n = wz_buf_.size();
+        std::vector<double> v;
+        int src = 0;
+        size_t a = 0, b = 0;
+
+        // ① still 이 연속 still_min_sec 이상인 구간 — 여러 개면 가장 늦은 것(가장 자리 잡은 상태).
+        //   구간 길이는 첫·끝 샘플 간격이 아니라 **샘플 수 × 평균 주기**다. 22샘플이 11 Hz 면(지금은 19.3Hz 라 같은 2초가 39샘플이다)
+        //   간격은 1.89초지만 덮는 시간은 2.0초 — 명세의 "2초 = 22샘플"이 이 뜻이다.
+        for (size_t i = 0; i < n; ) {
+            if (!wz_buf_[i].usable) { i++; continue; }
+            size_t j = i;
+            while (j + 1 < n && wz_buf_[j + 1].usable) j++;
+            const size_t cnt  = j - i + 1;
+            const double span = (wz_buf_[j].t - wz_buf_[i].t).seconds();
+            const double dur  = (cnt >= 2) ? span * (double)cnt / (double)(cnt - 1) : 0.0;
+            if (dur >= active_wz_still_min_sec_) { a = i; b = j; src = 1; }
+            i = j + 1;
+        }
+        if (src == 1) {
+            for (size_t k = a; k <= b; k++) v.push_back(wz_buf_[k].q);
+        } else if (n > 0) {
+            // ② 폴백: 대기 마지막 fallback_sec 초 (정지 여부 무관, q 가 유한한 것만)
+            const rclcpp::Time t_end = wz_buf_.back().t;
+            bool first = true;
+            for (size_t k = 0; k < n; k++) {
+                if ((t_end - wz_buf_[k].t).seconds() > active_wz_fallback_sec_) continue;
+                if (!std::isfinite(wz_buf_[k].q)) continue;
+                if (first) { a = k; first = false; }
+                b = k;
+                v.push_back(wz_buf_[k].q);
+            }
+            if ((int)v.size() >= active_wz_min_samples_) src = 2;
+            else v.clear();
+        }
+
+        if (src == 0) {
+            // ③ 영점 없음 — 0 으로 확정한다. q_wz = q 그대로 (기존 동작과 같음). NaN 이 아닌
+            //   이유: "확정 전"과 "확정했는데 없음"을 로그에서 구별하기 위해서다.
+            q_wz_ = 0.0; wz_src_ = 0; wz_have_window_ = false;
+            RCLCPP_WARN(this->get_logger(),
+                "[Hydro] 대기창 영점 없음 — 대기 %zu샘플 중 정지 구간 없음, 마지막 %.1f초 유효 샘플도 %d개 미만. "
+                "q_wz 는 q_raw − dP_hydro 그대로입니다. (압력·자세 스트림, start_delay_sec 확인)",
+                n, active_wz_fallback_sec_, active_wz_min_samples_);
+            return;
+        }
+
+        std::sort(v.begin(), v.end());
+        const double med    = v[v.size() / 2];
+        const double spread = v[(size_t)(0.95 * (v.size() - 1))] - v[(size_t)(0.05 * (v.size() - 1))];
+        q_wz_ = med; wz_src_ = src; wz_have_window_ = true;
+        wz_t0_ = wz_buf_[a].t; wz_t1_ = wz_buf_[b].t;
+        const rclcpp::Time now = this->now();
+        RCLCPP_WARN(this->get_logger(), "=========================================");
+        RCLCPP_WARN(this->get_logger(),
+            "[Hydro] 대기창 영점 확보: %.4f mbar  (%s, %zu샘플, 산포 %.4f, 구간 %.1f~%.1f초 전)",
+            q_wz_, src == 1 ? "정지 구간" : "**폴백** — 정지 구간 없어 대기 끝 구간 사용",
+            v.size(), spread, (now - wz_t0_).seconds(), (now - wz_t1_).seconds());
+        if (std::abs(q_wz_) > q_offset_max_)
+            RCLCPP_WARN(this->get_logger(),
+                "[Hydro]   ※ 영점이 %.1f mbar 를 넘습니다 — 포트 배정이나 배선을 의심하십시오. 그래도 적용합니다.",
+                q_offset_max_);
+        RCLCPP_WARN(this->get_logger(), "=========================================");
+    }
+
     // 두 각도 사이를 최단 경로로 보간한다. ±180 경계를 넘는 롤에서 값이 튀지 않게.
     static double lerp_angle(double a, double b, double f) {
         double d = std::fmod(b - a + 540.0, 360.0) - 180.0;
@@ -815,6 +1107,8 @@ private:
         // (실측 뒷받침: 3.87일 벤치에서 절대압은 날씨로 5.6~6.3 mbar 흘렀지만
         //  차압의 바닥은 0.053 mbar 였다 — 100배 이상 공통모드 상쇄.)
         float q_raw = nan_f, dph = nan_f, pitch_used = nan_f, q_out = nan_f, speed = nan_f;
+        float q_wz_out = nan_f, speed_wz = nan_f;   // 대기창 영점 경로 (필터 없음)
+        bool  wz_still_out = false;
 
         // **정압 포트는 둘 다 살아 있어야 한다.** 하나만 쓰면 유효 측정점이 롤 축(중점)에서
         // 4.4 cm 벗어나 롤 30도에서 2.13 mbar 가 누락되고, v=0.6 이 0.887 로 읽힌다(+48%).
@@ -828,7 +1122,7 @@ private:
 
         if (have_front && ns == 1) {
             // 래치만으로는 부족하다 — 간헐 고장이면 ns 가 1과 2를 오가며 래치가 계속
-            // 풀려 매 샘플 찍힌다(11Hz). 스로틀을 함께 건다.
+            // 풀려 매 샘플 찍힌다(약 19Hz). 스로틀을 함께 건다.
             RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
                 "[Hydro] 정압 포트가 하나뿐이라 **속도를 내지 않습니다**(NaN). 롤 상쇄가 깨져 "
                 "롤 30도에서 2.1 mbar 가 누락되기 때문입니다. 수심은 계속 나옵니다. "
@@ -837,6 +1131,11 @@ private:
 
         if (have_front && ns == 2) {
             q_raw = (float)((double)p[ch_front_] - ssum / ns);
+
+            // 대기창 정지 판정용 정압 이력. 절대압 평균의 **기울기**만 쓰므로 대기압 영점이
+            // 없어도(웜업 전에도) 판정된다 — q 가 영점을 안 쓰는 것과 같은 이유다.
+            rate_buf_.push_back(TSample{last_press_time_, ssum / ns});
+            trim_old(rate_buf_, last_press_time_, wz_window_sec_);
 
             // 자세를 **압력이 대표하는 과거 시각**에서 꺼낸다.
             double roll_u, pitch_u; bool att_sat = false, have_att = false;
@@ -883,7 +1182,7 @@ private:
                 if (std::isfinite(q_corr)) {
                     if (!q_lpf_seeded_) { q_lpf_ = q_corr; q_lpf_seeded_ = true; }
                     else {
-                        const double dt = 1.0 / 11.0;                 // 압력 실효 주기
+                        const double dt = 1.0 / PRESS_HZ;             // 압력 실효 주기
                         const double a  = dt / std::max(1e-6, q_lpf_tau_ + dt);
                         q_lpf_ = a * q_corr + (1.0 - a) * q_lpf_;
                     }
@@ -894,7 +1193,7 @@ private:
                 // a<<1 이면 sqrt(dt/2tau) = 1/sqrt(2*tau*f) 로 근사된다(tau=1s, f=11 에서 2% 과대).
                 // **q_lpf_ 와 비교하는 문턱은 전부 이 값을 써야 한다.** 원시 sigma 를 쓰면
                 // 실효 문턱이 14배로 뛴다 — 아래 뒤바뀜 감시가 실제로 그 실수를 하고 있었다.
-                const double sig_f = q_sigma_ / std::sqrt(std::max(1.0, 2.0 * q_lpf_tau_ * 11.0));
+                const double sig_f = q_sigma_ / std::sqrt(std::max(1.0, 2.0 * q_lpf_tau_ * PRESS_HZ));
                 const double band  = q_deadband_n_ * sig_f;
                 if (std::abs(q_lpf_) < band) {
                     speed = 0.0f;
@@ -918,13 +1217,13 @@ private:
                 // 놓친다. 하필 **첫 물 시험이 저속**이고 그때가 배선을 확인해야 할 때다.
                 // sig_f 로 바꾸면 0.22 m/s 까지 내려간다.
                 if (tail_rpm_ > 0 && q_lpf_ < -3.0 * sig_f) {
-                    if (++q_neg_run_ == 55) {   // ~5초
+                    if (++q_neg_run_ == (int)(5.0 * PRESS_HZ)) {   // ~5초
                         flags |= FLAG_Q_NEGATIVE;
                         RCLCPP_ERROR(this->get_logger(),
                             "[Hydro] 꼬리가 도는데 q 가 %.3f mbar 로 계속 음수입니다 — "
                             "앞/옆 포트 배정이 뒤바뀌었거나, 정체압 포트에 기포가 갇혔거나, 막혔습니다.",
                             q_lpf_);
-                    } else if (q_neg_run_ > 55) { flags |= FLAG_Q_NEGATIVE; }
+                    } else if (q_neg_run_ > (int)(5.0 * PRESS_HZ)) { flags |= FLAG_Q_NEGATIVE; }
                 } else { q_neg_run_ = 0; }
             }
 
@@ -932,6 +1231,29 @@ private:
             // 자세가 없으면 dph 가 NaN 이라 수집해도 무의미하다. 명시적으로 막는다 —
             // q 영점은 세션 내내 쓰는 상수라 한 번 오염되면 모든 속도가 틀어진다.
             if (q_zero_collecting_ && have_att) collect_q_zero(q_raw, dph, static_gauge);
+
+            // ── 대기창 물속 영점 ──────────────────────────────────────────
+            // q 는 q_offset 을 빼지 않은 (q_raw − dP_hydro) 다 — 이 영점이 Δb 까지 흡수한다.
+            const double q_plain = have_att ? ((double)q_raw - (double)dph) : NAN;
+            if (wz_enable_ && auto_state_ == AUTO_STATE_WAIT) {
+                double rate = NAN, gyro = NAN;
+                const bool still  = wz_is_still(rate, gyro);
+                // 자세가 없으면 q 가 NaN 이라 중앙값에 못 넣는다. 정지여도 "쓸 수 없음"이다.
+                const bool usable = still && std::isfinite(q_plain);
+                wz_buf_.push_back(WzSample{last_press_time_, q_plain, usable});
+                if (wz_buf_.size() > WZ_BUF_MAX) wz_buf_.pop_front();
+                wz_still_out = still;
+                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                    "[Hydro] 대기창 수집 %zu샘플 — 수심변화 %.1f mm/s, 자이로 %.1f dps -> %s%s",
+                    wz_buf_.size(), rate, gyro, still ? "정지" : "움직임",
+                    (still && !usable) ? " (자세 없음 -> 못 씀)" : "");
+            }
+            if (std::isfinite(q_plain) && std::isfinite(q_wz_)) {
+                q_wz_out = (float)(q_plain - q_wz_);
+                // 필터도 데드밴드도 없다 — 사후 분석이 같은 식을 오프라인으로 돌려 대조한다.
+                const double sgn = (q_wz_out >= 0.0f) ? 1.0 : -1.0;
+                speed_wz = (float)(speed_k_ * sgn * std::sqrt(2.0 * std::abs((double)q_wz_out) * 100.0 / rho_));
+            }
         }
 
         auto out = std_msgs::msg::Float32MultiArray();
@@ -944,6 +1266,14 @@ private:
         out.data[H_STATIC]   = static_gauge;
         out.data[H_PITCH]    = pitch_used;
         out.data[H_FLAGS]    = (float)flags;
+        // 대기창 물속 영점 (8~14)
+        out.data[H_WZ_ZERO]   = (float)q_wz_;
+        out.data[H_WZ_SRC]    = (float)wz_src_;
+        out.data[H_WZ_T0_AGE] = wz_have_window_ ? (float)(last_press_time_ - wz_t0_).seconds() : nan_f;
+        out.data[H_WZ_T1_AGE] = wz_have_window_ ? (float)(last_press_time_ - wz_t1_).seconds() : nan_f;
+        out.data[H_WZ_STILL]  = wz_still_out ? 1.0f : 0.0f;
+        out.data[H_WZ_Q]      = q_wz_out;
+        out.data[H_WZ_SPEED]  = speed_wz;
         hydro_pub_->publish(out);
 
         // 이관된 /sensor/pressure_calibrated — 영점 포착 전에는 발행하지 않는다.
@@ -964,6 +1294,15 @@ private:
     }
 
     void watchdog() {
+        // /auto/state 가 끊기면(auto_scenario_node 사망·재기동) IDLE 로 간주한다. WAIT 에
+        // 갇힌 채로 두면 다음 진입의 첫 상태 메시지가 WAIT→WAIT 라 전이를 못 본다.
+        if (auto_state_ != AUTO_STATE_IDLE &&
+            (this->now() - last_auto_state_time_).seconds() > 1.0) {
+            RCLCPP_WARN(this->get_logger(),
+                "[Hydro] /auto/state 가 1초 넘게 끊겼습니다 — IDLE 로 간주합니다 (auto_scenario_node 확인).");
+            set_auto_state(AUTO_STATE_IDLE);
+        }
+
         // q 수집 타임아웃. collect_q_zero() 는 압력 콜백 안에서만 도므로, 압력이 끊기면
         // 거기서는 영원히 판정이 안 된다. 그래서 타이머 쪽에서 본다.
         if (q_zero_collecting_ && (this->now() - q_collect_start_).seconds() > q_collect_timeout_) {
@@ -1022,7 +1361,7 @@ private:
         force_recapture_ = true;
         atm_retry_       = 0;
         RCLCPP_WARN(this->get_logger(), "[Hydro] 대기압 영점 재포착 시작 (%s, %d샘플 약 %.0f초) — 로봇을 흔들지 마십시오.",
-                    who, atm_window_, atm_window_ / 11.0);
+                    who, atm_window_, atm_window_ / PRESS_HZ);
     }
 
     // =========================================================================
@@ -1054,7 +1393,7 @@ private:
         q_collect_start_   = this->now();
         RCLCPP_WARN(this->get_logger(),
             "[Hydro] 물속 q 영점 수집 시작 (%d샘플 약 %.0f초) — 로봇을 물속에 정지시켜 두십시오.",
-            q_window_, q_window_ / 11.0);
+            q_window_, q_window_ / PRESS_HZ);
         res->success = true;
         res->message = "수집 시작 — 결과는 저널에 남습니다. 꼬리를 멈추고 흐름이 없게 하십시오.";
     }
@@ -1223,10 +1562,31 @@ private:
     rclcpp::Time q_collect_start_;
     rclcpp::Time node_start_time_, last_press_time_;
 
+    // ---- 대기창 물속 영점 (2026-09-16) ----
+    bool   wz_enable_;
+    double wz_rate_max_, wz_gyro_max_, wz_still_min_sec_, wz_fallback_sec_, wz_window_sec_;
+    int    wz_min_samples_;
+    // WAIT 진입 순간에 잠근 값 — 대기 중 파라미터를 바꿔도 이번 판정은 한 기준으로 간다
+    double active_wz_rate_max_ = 5.0, active_wz_gyro_max_ = 5.0;
+    double active_wz_still_min_sec_ = 2.0, active_wz_fallback_sec_ = 2.0;
+    int    active_wz_min_samples_ = 5;
+    int    auto_state_ = AUTO_STATE_IDLE;
+    rclcpp::Time last_auto_state_time_;
+    std::deque<TSample>  rate_buf_;   // (t, 정압 절대압 평균[mbar]) — 변화율 회귀용
+    std::deque<TSample>  gyro_buf_;   // (t, |ω|[도/초])
+    std::deque<WzSample> wz_buf_;     // WAIT 중 모은 (t, q, 쓸 수 있음)
+    double       q_wz_ = std::numeric_limits<double>::quiet_NaN();   // 확정 전 NaN, "없음"이면 0
+    int          wz_src_ = 0;
+    bool         wz_have_window_ = false;
+    rclcpp::Time wz_t0_, wz_t1_;
+
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr pressure_sub_;
     rclcpp::Subscription<std_msgs::msg::Int32MultiArray>::SharedPtr   rc_status_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3>::SharedPtr      attitude_sub_;
     rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr             rpm_sub_;
+    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr            imu_sub_;
+    rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr             auto_state_sub_;
+    rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr    hydro_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr    pressure_cal_pub_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr                zero_atm_srv_;
