@@ -5,10 +5,32 @@
 //
 //   [출력] /raw/magnetometer   (Vector3)            <- AK8963 지자기 3축, 100Hz
 //          /sensor/pressure_raw (Float32MultiArray[6]) <- MS5837 압력 3채널 + 온도 3채널, 약 11Hz
+//          /raw/imu_mpu9250     (Float32MultiArray[7]) <- MPU9250 6축 + 온도, 100Hz — **감시 전용** (2026-09-16)
+//                                [0..2] 가속도 [g]  [3..5] 자이로 [도/초]  [6] 칩 온도 [°C]
+//                                단위는 /raw/imu_6dof(nRF) 와 같은 g·도/초 규약이고, 축도 **nRF IMU 칩 축으로
+//                                돌려서** 낸다 — 그래서 CSV 24~29열과 56~61열은 열끼리 바로 뺄 수 있다.
+//
+//  ── MPU9250 6축을 왜 읽나 (2026-09-16) ─────────────────────────────────────
+//  자세 추정(EKF)은 nRF 에 달린 IMU 하나로 돈다. 그 자이로의 바이어스가 세션마다 50배씩
+//  다르고(z 축 −0.044 vs −2.2 도/초) 온도로도 흐르는데, 자이로가 하나뿐이면 "요가 흘렀다"가
+//  자이로 탓인지 필터 탓인지 가릴 수 없다. 같은 로봇에 붙은 두 번째 자이로는 진짜 회전은
+//  똑같이 읽고 바이어스만 독립이라, **둘의 차 = 바이어스 차** 가 되어 튀는 순간을 사후에
+//  짚을 수 있다. 이 노드는 그 값을 **기록만** 한다 — EKF 도 제어도 이 토픽을 읽지 않는다.
+//  칩 온도를 같이 내는 것은 바이어스-온도 상관을 로그에서 보기 위해서다.
+//  설정: ±4 g / ±500 도/초, DLPF 41 Hz, 내부 200 Hz — 10 ms 틱마다 최신 샘플을 읽는다
+//  (틱과 칩이 비동기라 100 Hz 로 두면 같은 샘플을 두 번 읽거나 건너뛴다).
+//
+//  축 매핑 (2026-09-16 실측): 두 칩은 서로 다른 방향으로 붙어 있다. 정지 자세에서 두 IMU 가
+//  읽은 중력 벡터를 짝지어 부호 있는 순열을 구했다 — 로봇이 두 축으로 기울어 있어 세 성분
+//  크기(nRF 0.04/0.95/0.30, MPU 0.30/0.05/0.95)가 다 달라 대응이 유일하고, det +1, 잔차 0.96°.
+//    nRF_x = −MPU_y,   nRF_y = +MPU_z,   nRF_z = −MPU_x
+//  자이로에도 같은 순열을 쓴다 — 두 칩 모두 가속도와 자이로가 같은 축을 공유한다(nRF 쪽은
+//  2026-08-04/06 에 각각 검증됨). **회전 시험으로 자이로 쪽을 따로 확인한 적은 아직 없다.**
+//  nRF IMU 를 다시 장착하면 이 순열도 다시 재야 한다.
 //
 //  I2C 토폴로지
 //    /dev/i2c-1
-//      ├─ 0x68 MPU9250  : 자체 데이터는 안 쓰고, Bypass 모드만 켜서 AK8963을 노출시킴
+//      ├─ 0x68 MPU9250  : Bypass 모드로 AK8963 노출 + 6축·온도 읽기(감시용, 2026-09-16)
 //      ├─ 0x0C AK8963   : MPU9250 패키지 내부의 지자기 센서 (Bypass 상태에서만 접근 가능)
 //      └─ 0x70 TCA9548A : I2C 멀티플렉서
 //            ├─ ch0 → 0x76 MS5837-02BA (J5 커넥터)   ※ 02BA — 환산식이 30BA와 다름
@@ -16,8 +38,8 @@
 //            └─ ch2 → 0x76 MS5837-02BA (J7 커넥터)
 //          ※ MS5837 3개가 모두 같은 주소(0x76)라 멀티플렉서로 한 번에 하나씩만 연결한다.
 //
-//  ※ 주의: 타이머는 100Hz지만 압력 센서는 변환 대기 때문에 약 11Hz로만 갱신된다.
-//          (아래 상태 머신 주석 참고). 지자기만 진짜 100Hz다.
+//  ※ 주의: 타이머는 100Hz지만 압력 센서는 변환 대기 때문에 약 20Hz로만 갱신된다
+//          (2026-09-19 에 11 -> 20Hz. 아래 상태 머신 주석 참고). 지자기만 진짜 100Hz다.
 // =============================================================================
 
 #include <rclcpp/rclcpp.hpp>
@@ -39,6 +61,7 @@
 #define I2C_BUS "/dev/i2c-1"
 #define TCA9548A_ADDR 0x70   // I2C 멀티플렉서
 #define AK8963_ADDR   0x0C   // 지자기 센서 (MPU9250 Bypass 시 노출)
+#define MPU9250_ADDR  0x68   // 6축 IMU (감시용) + AK8963 의 바이패스 게이트
 #define MS5837_ADDR   0x76   // 수심(압력) 센서 — 3채널 공통 주소
 
 class I2cDriverNode : public rclcpp::Node {
@@ -56,6 +79,7 @@ public:
         // ROS2 퍼블리셔 등록
         mag_pub_ = this->create_publisher<geometry_msgs::msg::Vector3>("/raw/magnetometer", 10);
         pressure_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/sensor/pressure_raw", 10);
+        mpu_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/raw/imu_mpu9250", 10);
 
         // 100Hz 주기 하드웨어 폴링 제어 타이머 시동 (10ms)
         i2c_timer_ = this->create_wall_timer(
@@ -80,12 +104,32 @@ private:
         // 회로도 J4 커넥터: MPU9250 주소 접근 후 Bypass 모드 기동 (하단 AK8963 활성화용)
         // AK8963은 물리적으로 MPU9250 패키지 안에 있고 보조 I2C 버스에 매달려 있다.
         // Bypass를 켜야 메인 버스에서 0x0C로 직접 보인다.
-        if (ioctl(i2c_fd_, I2C_SLAVE, 0x68) >= 0) {
+        if (ioctl(i2c_fd_, I2C_SLAVE, MPU9250_ADDR) >= 0) {
             uint8_t user_ctrl[2] = {0x6A, 0x00};   // USER_CTRL: MPU의 보조 I2C 마스터 기능 해제
             if (write(i2c_fd_, user_ctrl, 2) < 0) { /* 경고 방어용 무동작 처리 */ }
 
             uint8_t int_config[2] = {0x37, 0x02}; // Bypass Mode Enable
             if (write(i2c_fd_, int_config, 2) == 2) usleep(20000);
+
+            // ── 6축 감시용 설정 (2026-09-16). 바이패스와 무관하게 자체 레지스터만 만진다 ──
+            // WHO_AM_I 로 신원을 확인하고, 실패하면 이 세션 내내 6축을 읽지 않는다
+            // (AK8963 과 같은 "부팅 때 한 번" 정책 — 재시도 없음. J4 를 다시 꽂았으면 노드 재시작).
+            uint8_t who = 0x75, id = 0;
+            if (write(i2c_fd_, &who, 1) == 1 && read(i2c_fd_, &id, 1) == 1 && id == 0x71) {
+                bool ok = true;
+                ok &= mpu_write(0x6B, 0x01);   // PWR_MGMT_1: 깨움, 클럭 = 자이로 PLL (리셋값도 0x01 이지만 명시)
+                ok &= mpu_write(0x1A, 0x03);   // CONFIG: 자이로 DLPF 41 Hz (지연 5.9 ms), 내부 Fs 1 kHz
+                ok &= mpu_write(0x19, 0x04);   // SMPLRT_DIV: 1 kHz/(1+4) = 200 Hz — 10 ms 틱마다 새 샘플이 있게
+                ok &= mpu_write(0x1B, 0x08);   // GYRO_CONFIG: ±500 도/초 (65.5 LSB/도/초)
+                ok &= mpu_write(0x1C, 0x08);   // ACCEL_CONFIG: ±4 g (8192 LSB/g)
+                ok &= mpu_write(0x1D, 0x03);   // ACCEL_CONFIG2: 가속도 DLPF 41 Hz (지연 11.8 ms)
+                usleep(10000);
+                has_mpu_ = ok;
+                if (ok) RCLCPP_INFO(this->get_logger(), "[MPU9250] 6축 감시 켜짐 (±4 g / ±500 도/초, DLPF 41 Hz, 100 Hz 발행 /raw/imu_mpu9250, nRF IMU 칩 축으로 회전).");
+                else    RCLCPP_WARN(this->get_logger(), "[MPU9250] 설정 쓰기 실패 — 6축 감시 끔 (지자기 바이패스는 그대로).");
+            } else {
+                RCLCPP_WARN(this->get_logger(), "[MPU9250] WHO_AM_I 응답 없음/불일치 (0x%02X, 기대 0x71) — 6축 감시 끔.", id);
+            }
         }
 
         // AK8963 지자기 센서 직접 제어 설정 동기화
@@ -301,8 +345,55 @@ private:
         return false;
     }
 
+    bool mpu_write(uint8_t reg, uint8_t val) {
+        uint8_t buf[2] = {reg, val};
+        return write(i2c_fd_, buf, 2) == 2;
+    }
+
+    // MPU9250 6축 + 온도 한 번 읽기 (0x3B~0x48 14바이트 버스트, 빅엔디안).
+    // 실패하면 NaN 7개 — 죽은 압력 채널과 같은 규약(0.0 이 아니다). 로거는 그대로 적는다.
+    void read_mpu9250() {
+        auto msg = std_msgs::msg::Float32MultiArray();
+        const float nan_f = std::numeric_limits<float>::quiet_NaN();
+        msg.data.assign(7, nan_f);
+
+        uint8_t start = 0x3B, b[14];
+        const bool ok = ioctl(i2c_fd_, I2C_SLAVE, MPU9250_ADDR) >= 0
+                     && write(i2c_fd_, &start, 1) == 1 && read(i2c_fd_, b, 14) == 14;
+        if (ok) {
+            auto s16 = [&](int i) { return static_cast<int16_t>((b[i] << 8) | b[i + 1]); };
+            // 배율은 init_i2c() 의 설정과 짝이다 — 한쪽만 바꾸면 값이 조용히 2배/4배 틀어진다
+            const float ax = s16(0)  / 8192.0f, ay = s16(2)  / 8192.0f, az = s16(4)  / 8192.0f;   // MPU 칩 축 [g]
+            const float gx = s16(8)  / 65.5f,   gy = s16(10) / 65.5f,   gz = s16(12) / 65.5f;     // MPU 칩 축 [도/초]
+            // MPU 칩 축 -> nRF IMU 칩 축 (파일 머리말의 실측 순열). 순수 축 교환이라 정보 손실 없음
+            msg.data[0] = -ay;   // nRF_x = −MPU_y
+            msg.data[1] =  az;   // nRF_y = +MPU_z
+            msg.data[2] = -ax;   // nRF_z = −MPU_x
+            msg.data[3] = -gy;
+            msg.data[4] =  gz;
+            msg.data[5] = -gx;
+            msg.data[6] = s16(6)  / 333.87f + 21.0f;   // 칩 온도 [°C] (데이터시트: 333.87 LSB/°C, 21 °C 기준)
+            if (mpu_fail_streak_ >= 300)
+                RCLCPP_WARN(this->get_logger(), "[MPU9250] 6축 복구됨 (%d틱 만에).", mpu_fail_streak_);
+            mpu_fail_streak_ = 0;
+        } else {
+            if (++mpu_fail_streak_ == 300)            // 약 3초
+                RCLCPP_ERROR(this->get_logger(),
+                    "[MPU9250] 6축 %d틱 연속 읽기 실패 — NaN 발행 중. J4/버스 확인 (지자기도 같은 커넥터).",
+                    mpu_fail_streak_);
+            else if (mpu_fail_streak_ > 300 && mpu_fail_streak_ % 3000 == 0)
+                RCLCPP_ERROR(this->get_logger(), "[MPU9250] 6축 실패 지속 (%d틱, 약 %d초).",
+                             mpu_fail_streak_, mpu_fail_streak_ / 100);
+        }
+        mpu_pub_->publish(msg);
+    }
+
     // 10ms 마다 정밀 기동되는 하드웨어 I2C 트랜잭션 루프
     void i2c_polling_loop() {
+        // 0. MPU9250 6축·온도 (감시용, 매 틱 = 100Hz). 지자기보다 먼저 읽는다 — 둘 다 같은
+        //    J4 라 순서는 상관없지만, 압력 상태머신이 먹스를 건드리기 전에 IMU 쪽을 끝내둔다.
+        if (has_mpu_) read_mpu9250();
+
         // 1. 지자기 데이터 판독 및 토픽 송신 (매 주기 = 100Hz)
         if (has_mag_) {
             float mx = 0.0f, my = 0.0f, mz = 0.0f;
@@ -334,17 +425,44 @@ private:
         //    약 17ms가 걸린다. usleep으로 기다리면 100Hz 타이머가 통째로 막히므로,
         //    타이머 주기(10ms)를 카운트하는 상태 머신으로 대기를 쪼갰다.
         //
-        //    state 0 : D1(압력) 변환 시작 명령을 3채널에 하달           (10ms)
-        //    state 1 : 40ms 대기 후 D1 수거 + D2(온도) 변환 명령 하달   (40ms)
-        //    state 2 : 40ms 대기 후 D2 수거 + 압력 환산 + 발행          (40ms)
-        //    => 한 바퀴 약 90ms, 즉 압력 토픽은 실질 약 11Hz로 발행된다.
+        //    state 0 : D1(압력) 변환 시작 명령을 3채널에 하달                    (10ms)
+        //    state 1 : 30ms 대기 후 D1 수거 (+ 온도 차례면 D2 변환 명령 하달)     (30ms)
+        //    state 2 : 30ms 대기 후 D2 수거                                       (30ms, 온도 차례에만)
+        //    => 온도를 거르는 사이클은 40ms(25Hz), 읽는 사이클만 70ms. 평균 약 23Hz.
+        //
+        //  ── 온도를 매 사이클 읽지 않는다 (2026-09-19) ──────────────────────────
+        //  예전엔 한 바퀴마다 D1·D2 를 모두 변환해 90ms(약 11Hz)였다. 그런데 **온도는
+        //  거의 움직이지 않는다**: 2026-09-18 로그 13분 실측에서 분당 0.00~0.06°C,
+        //  즉 0.5초에 0.0005°C 로 온도 분해능(0.01°C)의 1/20 이다. 반면 그 40ms 대기는
+        //  압력 주기의 절반을 먹고 있었다.
+        //  그래서 TEMP_EVERY(10) 사이클에 한 번만 D2 를 새로 변환하고, 사이에는 직전
+        //  D2 를 그대로 쓴다. 압력이 11 -> 약 20Hz 가 되고 분해능 손실은 없다
+        //  (OSR 8192 그대로, 보정식도 그대로 — D2 값만 최대 0.5초 묵을 뿐이다).
+        //
+        //  ※ **묵은 D2 를 쓰는 것과 "죽은 센서의 옛 값"을 구별해야 한다.** D2 는 static
+        //    이라 갱신에 실패해도 직전 값이 남는데, 그건 아래 D1 주석이 경고하는 바로 그
+        //    함정이다. 그래서 채널별로 "마지막 D2 수거가 성공했는가"(d2_ok)를 따로 들고,
+        //    실패하면 즉시 0 으로 무효화해 환산 가드에 걸리게 한다. 건너뛴 사이클은
+        //    **성공한 값을 재사용**하는 것이고, 실패한 값을 재사용하는 것이 아니다.
+        //  ※ 압력(D1)은 **매 사이클 새로 변환한다** — 거르는 것은 온도뿐이다.
+        // 변환 대기 [10ms 틱]. OSR 8192 데이터시트 최대 17.2ms -> 3틱(30ms)이면 1.7배 여유.
+        // 줄이려면 OSR 을 함께 낮춰야 한다 (0x4A/0x5A 의 하위 비트).
+        static constexpr int CONV_TICKS = 3;
+        static constexpr int TEMP_EVERY = 10;          // 온도 변환 주기 [사이클] — 20Hz 에서 0.5초
+        static int  temp_countdown = 0;                // 0 이면 이번 사이클에 온도를 읽는다
+        static bool temp_turn = false;                 // 이번 사이클이 온도 차례인가 (state 1->2 전달)
         static int state = 0;
         static int delay_counter = 0;
         static uint32_t D1[3] = {0}, D2[3] = {0};      // 채널별 원시 ADC (압력/온도)
+        static bool d2_ok[3] = {false, false, false};  // 마지막 D2 수거 성공 여부 (재사용 가드)
         static float filtered_P[3] = {0.0f};           // 채널별 발행값 (필터 없음 — 아래 참조)
         uint8_t adc_buf[3];
 
         if (state == 0) {
+            // 이번 바퀴에 온도를 새로 읽을지 여기서 정한다 (state 1 에서 명령을 내린다)
+            temp_turn = (temp_countdown <= 0);
+            if (temp_turn) temp_countdown = TEMP_EVERY; else temp_countdown--;
+
             // 압력 데이터(D1) 변환 명령 동시 하향
             for (int i = 0; i < 3; i++) {
                 if (prom_C_[i][1] == 0) continue;                 // 죽은 채널 건너뜀
@@ -357,8 +475,12 @@ private:
             state = 1; delay_counter = 0;
         }
         else if (state == 1) {
-            // 변환 대기 (약 40ms 안정 확보)
-            if (++delay_counter >= 4) {
+            // 변환 대기. delay_counter 는 이 틱에서 처음 증가하므로 >= N 은 **N 틱 = N*10ms**
+            // 를 기다린다는 뜻이다 (state 0 에서 0 으로 놓고 왔다). CONV_TICKS=3 -> 30ms 로,
+            // OSR 8192 의 데이터시트 최대 변환 시간 17.2ms 에 1.7배 여유다.
+            // 예전 값 4(=40ms)는 여유가 2.3배였는데, state 0 의 1틱까지 더하면 한 단계가
+            // 50ms 여서 온도를 걸러도 60ms(16Hz)에 머물렀다. 30ms 로 줄여 50ms(20Hz)를 맞춘다.
+            if (++delay_counter >= CONV_TICKS) {
                 for (int i = 0; i < 3; i++) {
                     if (prom_C_[i][1] == 0) continue;
                     // mux 선택에 실패하면 엉뚱한 채널 값을 읽게 되므로 D1을 0으로 무효화
@@ -370,19 +492,25 @@ private:
                         } else {
                             D1[i] = 0;   // [필수] 실패 시 반드시 무효화 — 아래 주석 참조
                         }
-                        // 이어서 온도 데이터(D2) 변환 명령 하향
-                        uint8_t d2_cmd = 0x5A;   // D2(온도) 변환 시작, OSR=8192
-                        if (write(i2c_fd_, &d2_cmd, 1) < 0) { /* 경고 제어용 */ }
+                        // 이어서 온도 데이터(D2) 변환 명령 하향 — **온도 차례일 때만**.
+                        // 거르는 사이클은 이 40ms 대기가 통째로 빠져 주기가 90 -> 50ms 가 된다.
+                        if (temp_turn) {
+                            uint8_t d2_cmd = 0x5A;   // D2(온도) 변환 시작, OSR=8192
+                            if (write(i2c_fd_, &d2_cmd, 1) < 0) { /* 경고 제어용 */ }
+                        }
                     } else {
                         D1[i] = 0;
                     }
                 }
-                state = 2; delay_counter = 0;
+                state = 2;
+                // 온도 차례면 40ms 를 기다렸다 D2 를 수거하고, 아니면 기다릴 것이 없으므로
+                // 대기를 이미 끝난 것으로 놓아 **같은 틱에 바로 환산·발행**으로 간다.
+                delay_counter = temp_turn ? 0 : CONV_TICKS;
             }
         }
         else if (state == 2) {
-            // 변환 대기 (약 40ms 안정 확보)
-            if (++delay_counter >= 4) {
+            // 변환 대기 (온도를 거르는 사이클은 위에서 대기를 다 채워 보내 즉시 통과한다)
+            if (++delay_counter >= CONV_TICKS) {
                 auto out_pressure_msg = std_msgs::msg::Float32MultiArray();
                 // [0..2] 압력(mbar), [3..5] 온도(C).
                 //
@@ -414,14 +542,27 @@ private:
                     // 0.0이나 NaN보다 훨씬 위험하다 — 완벽하게 정상으로 보이기 때문이다.
                     // 잠수 중에 센서가 죽으면 수심이 그 값에 얼어붙고 아무도 모른다.
                     // 0은 아래 환산 가드가 무효로 걸러내고, 결국 NaN으로 발행된다.
-                    if (!select_mux_channel_retry(i)) { D2[i] = 0; continue; }
-                    if (ioctl(i2c_fd_, I2C_SLAVE, MS5837_ADDR) >= 0) {
-                        uint8_t adc_cmd = 0x00;
-                        if (write(i2c_fd_, &adc_cmd, 1) == 1 && read(i2c_fd_, adc_buf, 3) == 3) {
-                            D2[i] = ((uint32_t)adc_buf[0] << 16) | ((uint32_t)adc_buf[1] << 8) | adc_buf[2];
+                    // 온도 차례가 아니면 D2 를 읽지 않고 **직전에 성공한 값**을 그대로 쓴다.
+                    // d2_ok 가 false 면(마지막 수거가 실패했으면) 재사용하지 않고 0 으로 둬
+                    // 환산 가드에 걸리게 한다 — 죽은 센서의 옛 값이 되살아나지 않게 하는 선이다.
+                    if (temp_turn) {
+                        if (!select_mux_channel_retry(i)) { D2[i] = 0; d2_ok[i] = false; continue; }
+                        if (ioctl(i2c_fd_, I2C_SLAVE, MS5837_ADDR) >= 0) {
+                            uint8_t adc_cmd = 0x00;
+                            if (write(i2c_fd_, &adc_cmd, 1) == 1 && read(i2c_fd_, adc_buf, 3) == 3) {
+                                D2[i] = ((uint32_t)adc_buf[0] << 16) | ((uint32_t)adc_buf[1] << 8) | adc_buf[2];
+                                d2_ok[i] = (D2[i] != 0 && D2[i] != 0xFFFFFF);
+                            } else {
+                                D2[i] = 0; d2_ok[i] = false;
+                            }
                         } else {
-                            D2[i] = 0;
+                            D2[i] = 0; d2_ok[i] = false;
                         }
+                    } else if (!d2_ok[i]) {
+                        D2[i] = 0;   // 재사용 금지 — 아래 환산 가드가 NaN 으로 내보낸다
+                    }
+
+                    {
 
                         // 0xFFFFFF(통신 실패)와 0(미수거)은 환산에서 제외
                         if (D1[i] != 0xFFFFFF && D2[i] != 0xFFFFFF && D1[i] != 0 && D2[i] != 0) {
@@ -492,10 +633,11 @@ private:
                             filtered_P[i] = raw_pressure;
 
                             out_pressure_msg.data[i] = filtered_P[i];           // 압력 채널 0,1,2 (mbar)
+                            // 온도는 거르는 사이클에도 **직전 값으로 계속 채워 발행**한다.
+                            // 토픽 규격(6칸)과 CSV 20~22열이 그대로 유지되고, 소비자는
+                            // 온도가 최대 0.5초 묵을 수 있다는 것만 알면 된다 (분당 0.06°C).
                             out_pressure_msg.data[i + 3] = TEMP / 100.0f;       // 온도 채널 0,1,2 (C)
                         }
-                    } else {
-                        D2[i] = 0;
                     }
                 }
                 // 연속 실패 감지. 예전에는 먹스 선택 실패도 ADC 읽기 실패도 로그 없이
@@ -533,11 +675,14 @@ private:
 
     int i2c_fd_;
     int press_fail_streak_ = 0;   // 압력 전 채널 연속 실패 사이클 수 (버스 잠김 감지)
+    int mpu_fail_streak_   = 0;   // MPU9250 6축 연속 읽기 실패 틱 수
     bool has_mag_;
+    bool has_mpu_ = false;        // WHO_AM_I 0x71 확인 + 설정 성공 시에만 6축을 읽는다
     uint16_t prom_C_[3][8];   // [채널][PROM 워드] — [1]이 0이면 "해당 채널 사용 불가" 마커
     rclcpp::TimerBase::SharedPtr i2c_timer_;
     rclcpp::Publisher<geometry_msgs::msg::Vector3>::SharedPtr mag_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr pressure_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr mpu_pub_;
 };
 
 int main(int argc, char **argv) {

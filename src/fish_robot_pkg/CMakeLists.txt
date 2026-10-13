@@ -78,7 +78,7 @@ target_link_libraries(state_estimation_ekf_node ${M_LIB} Eigen3::Eigen)
 # 압력 3채널 -> 수심(현재) + 전진 속도(다음 단계). 관측 전용이며 어떤 제어
 # 루프도 아직 구독하지 않는다. Eigen 불필요 — 기하가 닫힌 형태 세 줄로 끝난다.
 add_executable(hydro_estimator_node src/hydro_estimator_node.cpp)
-ament_target_dependencies(hydro_estimator_node rclcpp std_msgs geometry_msgs std_srvs)
+ament_target_dependencies(hydro_estimator_node rclcpp std_msgs geometry_msgs sensor_msgs std_srvs)   # sensor_msgs: /raw/imu_6dof (대기창 정지 판정, 2026-09-16)
 target_link_libraries(hydro_estimator_node ${M_LIB})
 
 install(TARGETS
