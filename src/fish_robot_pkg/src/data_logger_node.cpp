@@ -13,8 +13,26 @@
 //          /raw/imu_6dof               (Imu)                  원시 6축 — g, 도/초 그대로
 //          /raw/magnetometer           (Vector3)              원시 지자기[µT], 보정 전 칩 축
 //          /filtered/ekf_status        (Float32MultiArray[12]) [0..2] 자이로 바이어스, [10] 플래그
-//          /filtered/hydro             (Float32MultiArray[8])  수심[m]·속도[m/s]·동압·자세보정
+//          /filtered/hydro             (Float32MultiArray[15]) 수심[m]·속도[m/s]·동압·자세보정 + 대기창 영점
+//          /auto/state                 (Int32)                0 IDLE / 1 WAIT / 2 RUN (auto_scenario_node)
+//          /raw/imu_mpu9250            (Float32MultiArray[7]) MPU9250 6축[g, 도/초, nRF IMU 칩 축으로 회전됨] + 칩 온도[°C] — 감시용 2번째 IMU
 //   [출력] ~/ros2_ws/log_csv/fish_log_YYYYMMDD_HHMMSS.csv
+//
+//  ── 절대 시각 (2026-10-07) ─────────────────────────────────────────────────
+//  Time(s) 는 **로거 기동 기준 경과 초**라 그 자체로는 다른 장비의 기록과 맞출 수 없다.
+//  예인 장치처럼 로봇 밖에서 따로 돌아가는 기록(파일명에 20261005_144706 식으로 시각이
+//  박힌다)과 같은 시간선에 올리려면 절대 시각이 필요하다. 파일명으로 역산할 수도 있지만
+//  초 단위라 10ms 행을 가릴 수 없고, 200MB 회전 뒤에는 Time(s) 가 이어지므로 두 번째
+//  파일부터는 파일명이 기준이 아니게 되어 더 어긋난다.
+//
+//  그래서 **마지막 열에 Epoch(s) 를 둔다** — UTC 기준 유닉스 시각(1970-01-01부터의 초),
+//  소수점 3자리(ms). 기존 열은 번호도 의미도 그대로이므로 옛 분석 스크립트가 깨지지 않는다.
+//    · 다른 장비와 맞추기: 양쪽을 Epoch 로 바꿔 빼면 끝난다 (시간대·서머타임 무관)
+//    · 사람이 읽기: date -d @1760000000  또는  파이썬 datetime.fromtimestamp()
+//    · Time(s) 와의 차 = 로거 기동 시각. 파일 회전을 넘어도 일정하다
+//  ※ 벽시계(system_clock)라 NTP 가 시각을 당기면 **뒤로 뛸 수 있다**. 그래서 구간 길이·
+//    주기 계산은 지금까지처럼 **Time(s)(단조 증가)로** 하고, Epoch 는 **다른 기록과
+//    맞추는 용도로만** 쓴다. 두 열을 다 남기는 이유가 이것이다.
 //
 //  설계 : 콜백은 값을 멤버 변수에 "저장만" 하고, 10ms 타이머가 그 순간의
 //         최신 스냅샷을 한 줄로 기록한다. 토픽마다 주기가 달라도(압력 11Hz,
@@ -23,7 +41,7 @@
 //  원시값 3종을 상시 기록하는 이유(2026-08-18): 물속 운용은 재현이 안 된다.
 //  융합 결과만 남으면 자세 이상이 "센서 탓인지 필터 탓인지" 사후 규명이 불가능하다.
 //
-//  ※ 크기: 100Hz x 47컬럼 ≈ 시간당 99MB. 파일당 200MB(약 2.0시간)에서 새 파일로
+//  ※ 크기: 100Hz x 63컬럼 ≈ 시간당 131MB (62컬럼 125MB, 55컬럼 110MB, 47컬럼 99MB). 파일당 200MB(약 2.0시간)에서 새 파일로
 //     회전하며, Time(s) 축은 회전을 넘어 이어진다(기동 시각 기준 유지). 오래된
 //     파일은 지우지 않는다 — log_csv/에는 실험 CSV와 지자기 보정 파일이 같이
 //     살므로 자동 삭제는 위험하다. 총량 관리는 사람 몫.
@@ -42,6 +60,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <cmath>
 #include <limits>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -92,8 +111,12 @@ public:
             const float nf = std::numeric_limits<float>::quiet_NaN();
             depth_ = nf; speed_ = nf; q_dyn_ = nf; q_raw_ = nf;
             p_hydro_ = nf; hydro_pitch_ = nf;
+            q_zero_ = nf; zero_t0_ = nf; zero_t1_ = nf; q_dyn_wz_ = nf; speed_wz_ = nf;
         }
         hydro_seq_ = 0; hydro_flags_ = 0;
+        zero_src_ = 0; still_ = 0; auto_state_ = 0;
+        // 2번째 IMU 도 NaN 으로 시작 — 미수신과 0 을 구별
+        for (int i = 0; i < 7; i++) mpu_[i] = std::numeric_limits<float>::quiet_NaN();
 
         received_attitude_ = false;
         received_pressure_ = false;
@@ -135,6 +158,23 @@ public:
 
         hydro_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
             "/filtered/hydro", 10, std::bind(&DataLoggerNode::hydro_callback, this, std::placeholders::_1));
+
+        // AUTO 대기/주행 상태 (auto_scenario_node, 100 Hz). hydro 배열로 받으면 11 Hz 라
+        // 전이 시각이 90 ms 뭉개지므로 직접 받는다. 0 IDLE / 1 WAIT / 2 RUN.
+        auto_state_sub_ = this->create_subscription<std_msgs::msg::Int32>(
+            "/auto/state", 10,
+            [this](const std_msgs::msg::Int32::SharedPtr msg) { auto_state_ = msg->data; });
+
+        // 2번째 IMU (MPU9250, i2c_driver_node, 100 Hz) — 감시용. 자이로 바이어스가 튀는
+        // 순간을 nRF IMU 와의 차이로 사후에 짚기 위한 것. i2c_driver_node 가 nRF IMU 칩 축으로
+        // 돌려서 보내므로 24~29열과 열끼리 바로 뺄 수 있다.
+        mpu_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
+            "/raw/imu_mpu9250", 10,
+            [this](const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
+                if (msg->data.size() < 7) return;
+                note_first_arrival(received_mpu_, "2번째 IMU(mpu9250)");
+                for (int i = 0; i < 7; i++) mpu_[i] = msg->data[i];
+            });
 
         // 100Hz 기록 타이머 (모든 토픽의 최신 스냅샷을 한 줄로)
         logging_timer_ = this->create_wall_timer(
@@ -194,10 +234,21 @@ private:
         //   ② 없으면 Q_dyn = Q_raw - P_hydro - q_offset 을 감사할 수 없다
         //   ③ pitch 는 두 토픽에서 같은 값이라, 6열과의 상호상관 지연이 곧 파이프라인
         //      지연이다 — 열 하나로 공짜 지연 측정기를 얻는다
+        // 48~55열: 대기창 물속 영점 (2026-09-16). AUTO 진입 대기 중 정지 구간의 q 를 그 주행의
+        //   영점으로 잡은 것. 기존 Q_dyn/Speed 는 손대지 않고(비교용) 새 열로 나란히 낸다.
+        //   Q_zero: 적용 중인 영점[mbar] (확정 전 nan, 없음이면 0) / Zero_src: 0 없음·1 정지 구간·2 폴백
+        //   Zero_t0·t1: 영점 구간 시각 (Time(s) 축) / Still: WAIT 중 정지 판정 0/1
+        //   Q_dyn_wz = Q_raw − P_hydro − Q_zero (필터 없음) / Speed_wz / State: 0 IDLE·1 WAIT·2 RUN
+        // 63열: Epoch(s) — UTC 유닉스 시각[초, ms 정밀도]. 로봇 밖 기록과 같은 시간선에 올리는 열.
+        //   맨 뒤에 붙여 기존 열 번호를 하나도 건드리지 않았다 (머리말 "절대 시각" 참조).
+        // 56~62열: MPU9250 6축 + 온도 (2026-09-16, 감시용 2번째 IMU). 단위는 24~29열과 같은 g·도/초,
+        //   축도 **nRF IMU 칩 축으로 회전되어 온다** (i2c_driver_node, 2026-09-16 중력 실측 순열). 두 자이로 차 = 바이어스 차.
         fprintf(fp_, "Time(s),Btn1_Count,Mode,AutoMode,Roll,Pitch,Yaw,RC_T,RC_R,RC_P,RC_Y,M1,M2,M3,M4,RPM,P0_cal,P1_cal,P2_cal,T0,T1,T2,RSSI,"
                      "AX,AY,AZ,GX,GY,GZ,MX,MY,MZ,BiasX,BiasY,BiasZ,EKF_Flags,"
                      "P0_raw,P1_raw,P2_raw,"
-                     "Depth,Speed,Q_dyn,Q_raw,P_hydro,Hydro_Pitch,Hydro_Seq,Hydro_Flags\n");
+                     "Depth,Speed,Q_dyn,Q_raw,P_hydro,Hydro_Pitch,Hydro_Seq,Hydro_Flags,"
+                     "Q_zero,Zero_src,Zero_t0,Zero_t1,Still,Q_dyn_wz,Speed_wz,State,"
+                     "MPU_AX,MPU_AY,MPU_AZ,MPU_GX,MPU_GY,MPU_GZ,MPU_T,Epoch(s)\n");
         fflush(fp_);   // 헤더는 즉시 기록해 파일이 비어 보이지 않게 한다
 
         return 0;
@@ -340,7 +391,8 @@ private:
         ekf_flags_ = static_cast<int32_t>(msg->data[10]);
     }
 
-    // /filtered/hydro = [depth, speed, q, q_raw, dP_hydro, static, pitch_used, flags]
+    // /filtered/hydro = [depth, speed, q, q_raw, dP_hydro, static, pitch_used, flags,
+    //                    wz_zero, wz_src, wz_t0_age, wz_t1_age, wz_still, q_wz, speed_wz]  (8~14: 2026-09-16)
     void hydro_callback(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
         if (msg->data.size() < 8) return;
         note_first_arrival(received_hydro_, "수심/속도(hydro)");
@@ -353,6 +405,24 @@ private:
         hydro_flags_ = static_cast<int32_t>(msg->data[7]);
         hydro_seq_++;   // 11Hz 신호가 100Hz CSV에서 같은 값 9행으로 늘어나므로,
                         // 새 샘플이 어느 행에 떨어졌는지 이것 없이는 식별 불가다
+
+        // 대기창 영점 (2026-09-16). 옛 8칸 발행자면 nan/0 으로 남긴다.
+        const float nf = std::numeric_limits<float>::quiet_NaN();
+        if (msg->data.size() >= 15) {
+            q_zero_   = msg->data[8];
+            zero_src_ = static_cast<int32_t>(msg->data[9]);
+            still_    = static_cast<int32_t>(msg->data[12]);
+            q_dyn_wz_ = msg->data[13];
+            speed_wz_ = msg->data[14];
+            // 구간 시각은 "지금보다 몇 초 전"(나이)으로 온다 — float32 에 epoch 초를 실으면
+            // 128초 단위로 뭉개지기 때문이다. 여기서 Time(s) 축으로 환산한다.
+            const double t_now = is_logging_active_ ? (this->now() - start_time_).seconds() : NAN;
+            zero_t0_ = (std::isfinite(msg->data[10]) && std::isfinite(t_now)) ? (float)(t_now - msg->data[10]) : nf;
+            zero_t1_ = (std::isfinite(msg->data[11]) && std::isfinite(t_now)) ? (float)(t_now - msg->data[11]) : nf;
+        } else {
+            q_zero_ = nf; zero_src_ = 0; still_ = 0; q_dyn_wz_ = nf; speed_wz_ = nf;
+            zero_t0_ = nf; zero_t1_ = nf;
+        }
     }
 
     void write_log_loop() {
@@ -365,7 +435,19 @@ private:
             is_logging_active_ = true;
             start_time_ = this->now();   // 이 시각이 Time(s) 컬럼의 0초
             RCLCPP_INFO(this->get_logger(), "=========================================");
-            RCLCPP_INFO(this->get_logger(), "[Data Logger] 데이터 로깅을 0.0초부터 시작합니다.");
+            {
+                // 다른 장비 기록과 맞출 때 쓸 기준점을 저널에 남긴다. CSV 의 Epoch(s) 와
+                // 같은 시계이고, Time(s)=0 이 이 시각에 해당한다.
+                struct timespec ts0;
+                clock_gettime(CLOCK_REALTIME, &ts0);
+                struct tm tm0;
+                localtime_r(&ts0.tv_sec, &tm0);
+                char buf[64];
+                strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm0);
+                RCLCPP_INFO(this->get_logger(),
+                    "[Data Logger] 데이터 로깅을 0.0초부터 시작합니다. (Time(s)=0 => %s.%03ld, Epoch %.3f)",
+                    buf, ts0.tv_nsec / 1000000, (double)ts0.tv_sec + ts0.tv_nsec * 1e-9);
+            }
             RCLCPP_INFO(this->get_logger(), "[Data Logger] (센서 미연결 구간은 초기값으로 기록됩니다)");
             RCLCPP_INFO(this->get_logger(), "=========================================");
         }
@@ -373,6 +455,13 @@ private:
         if (fp_ == nullptr) return;
 
         double relative_time_sec = (this->now() - start_time_).seconds();
+
+        // 절대 시각 — **벽시계를 직접 읽는다.** this->now() 는 노드 시계(기본 시스템 시계와
+        // 같지만 use_sim_time 등으로 갈릴 수 있다)이므로, 다른 장비와 맞추는 값은 OS 시계에서
+        // 바로 가져와 해석이 한 가지로 고정되게 한다.
+        struct timespec ts_now;
+        clock_gettime(CLOCK_REALTIME, &ts_now);
+        const double epoch_sec = (double)ts_now.tv_sec + (double)ts_now.tv_nsec * 1e-9;
 
         // btn1_cumulative_count_ 를 기록합니다.
         // 자릿수: 가속도/바이어스 %.4f (바이어스 불안정성 실측이 0.001도/초 수준),
@@ -382,7 +471,10 @@ private:
         fprintf(fp_, "%.3f,%d,%d,%d,%.2f,%.2f,%.2f,%d,%d,%d,%d,%u,%u,%u,%u,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,"
                      "%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.4f,%.4f,%.4f,%d,"
                      "%.3f,%.3f,%.3f,"
-                     "%.4f,%.3f,%.4f,%.4f,%.4f,%.2f,%d,%d\n",
+                     "%.4f,%.3f,%.4f,%.4f,%.4f,%.2f,%d,%d,"
+                     "%.4f,%d,%.2f,%.2f,%d,%.4f,%.3f,%d,"
+                     "%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.1f,"
+                     "%.3f\n",
                 relative_time_sec,
                 btn1_cumulative_count_,
                 mode_,
@@ -400,7 +492,10 @@ private:
                 bias_x_, bias_y_, bias_z_,
                 ekf_flags_,
                 p0_raw_, p1_raw_, p2_raw_,
-                depth_, speed_, q_dyn_, q_raw_, p_hydro_, hydro_pitch_, hydro_seq_, hydro_flags_);
+                depth_, speed_, q_dyn_, q_raw_, p_hydro_, hydro_pitch_, hydro_seq_, hydro_flags_,
+                q_zero_, zero_src_, zero_t0_, zero_t1_, still_, q_dyn_wz_, speed_wz_, auto_state_,
+                mpu_[0], mpu_[1], mpu_[2], mpu_[3], mpu_[4], mpu_[5], mpu_[6],
+                epoch_sec);
 
         // 50줄(0.5초)마다 디스크로 강제 플러시.
         // 매 줄 플러시하면 SD카드 I/O로 100Hz 루프가 밀리고, 아예 안 하면
@@ -433,6 +528,7 @@ private:
     bool received_attitude_;    // 최초 수신 로그를 한 번만 찍기 위한 래치
     bool received_pressure_;
     bool received_hydro_ = false;
+    bool received_mpu_   = false;
     bool is_logging_active_;
     rclcpp::Time start_time_;   // Time(s) 컬럼의 기준 시각
 
@@ -454,6 +550,9 @@ private:
     float p0_raw_, p1_raw_, p2_raw_;  // 채널별 원시 절대압(mbar, 영점 전). 고장/미수신 = NaN
     float depth_, speed_, q_dyn_, q_raw_, p_hydro_, hydro_pitch_;   // hydro. 미수신 = NaN
     int32_t hydro_seq_, hydro_flags_;
+    float q_zero_, zero_t0_, zero_t1_, q_dyn_wz_, speed_wz_;      // 대기창 영점. 미확정 = NaN
+    int32_t zero_src_, still_, auto_state_;                       // 0 없음/1 정지/2 폴백, 0/1, 0 IDLE/1 WAIT/2 RUN
+    float mpu_[7];                                                // MPU9250 [ax ay az g, gx gy gz 도/초, 온도 °C]. 미수신 = NaN
     int32_t rssi_;
     float ax_, ay_, az_, gx_, gy_, gz_;      // 원시 6축 [g, 도/초]
     float mx_, my_, mz_;                     // 원시 지자기 [µT], 보정 전 칩 축
@@ -474,6 +573,8 @@ private:
     rclcpp::Subscription<geometry_msgs::msg::Vector3>::SharedPtr mag_raw_sub_;
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr ekf_status_sub_;
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr hydro_sub_;
+    rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr auto_state_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr mpu_sub_;
 };
 
 int main(int argc, char **argv) {

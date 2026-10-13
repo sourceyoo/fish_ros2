@@ -5,7 +5,8 @@
 //
 //   [입력] /filtered/attitude  (Vector3)    <- 현재 자세 + 모드 플래그
 //          /rc/command         (Quaternion) <- 조종기 목표값 (수동 모드)
-//          /auto/command       (Quaternion) <- 시나리오 목표값 (자동 모드)
+//          /auto/command       (Quaternion) <- 시나리오 목표값 (자동 모드).
+//                                            z = 서보 고정 플래그 (2026-09-16, 아래 참조)
 //          /sensor/tail_rpm    (Int32)      <- 꼬리 RPM (현재는 수집만)
 //   [출력] /motor/output       (UInt16MultiArray[4]) -> uart_bridge_node
 //
@@ -15,10 +16,17 @@
 //  출력 채널 배치 : [0]=좌 서보, [1]=우 서보, [2]=요 서보, [3]=꼬리 BLDC 스로틀
 //
 //  ※ 요 제어 없음 (2026-09-14, 운용자 결정): 요 서보 [2] 는 항상 1500(중앙) 고정이다.
-//     조종기 요 스틱(/rc/command z)과 시나리오 요 목표(/auto/command z)는 읽지 않고,
-//     헤딩 오차로 서보를 움직이는 요 PID 도 없다. 좌우 지느러미 믹싱은 원래 롤·피치만
-//     쓰므로 영향이 없다. 되살릴 때는 git 이력에서 kp_yaw 파라미터 시절을 볼 것 —
-//     그때 요 오차가 ±180 경계를 감싸지 않던 결함도 같이 고쳐야 한다.
+//     조종기 요 스틱(/rc/command z)은 읽지 않고, 헤딩 오차로 서보를 움직이는 요 PID 도
+//     없다. 좌우 지느러미 믹싱은 원래 롤·피치만 쓰므로 영향이 없다. 되살릴 때는 git
+//     이력에서 kp_yaw 파라미터 시절을 볼 것 — 그때 요 오차가 ±180 경계를 감싸지 않던
+//     결함도 같이 고쳐야 한다.
+//
+//  ※ 서보 고정 플래그 — /auto/command z (2026-09-16): 요가 비우고 간 z 칸을 재활용한다.
+//     **요 목표가 아니다.** AUTO 에서 z >= 0.5 면 PID 를 통째로 건너뛰고
+//     [1500, 1500, 1500, 1000] 을 그대로 낸다 (auto_scenario_node 의 `static` 시나리오).
+//     "추력 0, 롤·피치 0" 만으로는 가만히 있지 않기 때문이다 — 목표가 0 이어도 로봇이
+//     기울면 오차가 생기고 PID 가 지느러미를 움직인다. 구동 없이 센서만 재려면 출력
+//     자체를 끊어야 한다. MANUAL 에서는 무시한다(조종기 경로는 z 를 안 쓴다).
 // =============================================================================
 
 #include <rclcpp/rclcpp.hpp>
@@ -88,7 +96,7 @@ public:
                        // rc_throttle_를 -9999(두절 센티넬)로 시작 -> 첫 조종기 패킷이
                        // 도착하기 전까지는 페일세이프 상태로 묶어둔다.
                        rc_roll_(0), rc_pitch_(0), rc_throttle_(-9999),
-                       auto_roll_(0), auto_pitch_(0), auto_throttle_(1000),
+                       auto_roll_(0), auto_pitch_(0), auto_throttle_(1000), auto_hold_(false),
                        is_auto_mode_(false),
                        current_rpm_(0),
                        failsafe_timeout_(5.0),                 // 조종기 무수신 허용 시간(초)
@@ -217,7 +225,9 @@ private:
     void auto_command_callback(const geometry_msgs::msg::Quaternion::SharedPtr msg) {
         auto_roll_ = static_cast<int16_t>(msg->x);
         auto_pitch_ = static_cast<int16_t>(msg->y);
-        // msg->z(요 목표)는 읽지 않는다 — 요 제어 없음 (2026-09-14)
+        // msg->z 는 요 목표가 아니라 **서보 고정 플래그**다 (2026-09-16, 파일 머리말 참조).
+        // 요 제어는 2026-09-14 에 없앴고, 비어 버린 이 칸을 재활용한 것이다.
+        auto_hold_ = (msg->z >= 0.5);
         auto_throttle_ = static_cast<int16_t>(msg->w);
     }
 
@@ -339,6 +349,24 @@ private:
             active_throttle = constrain_pwm(1000 + mapped_throttle);
         }
 
+        // ---- [완전 정지] 시나리오가 서보 고정을 요청하면 PID 를 통째로 건너뛴다 ----
+        // 목표를 0 으로 주는 것과 다르다: 목표가 0 이어도 로봇이 기울면 오차가 생겨
+        // 지느러미가 움직인다. 여기서는 출력 자체를 중립으로 못박아 구동을 끊는다.
+        // 적분·미분 상태도 함께 지운다 — 정지 구간의 오차가 쌓여 있다가 다음 주행
+        // 시작 순간에 한꺼번에 튀어나오면(와인드업) 그게 곧 첫 동작이 되어 버린다.
+        if (is_auto_mode_ && auto_hold_) {
+            err_sum_roll_ = 0.0f; err_sum_pitch_ = 0.0f;
+            prev_err_roll_ = 0.0f; prev_err_pitch_ = 0.0f;
+            motor_output_msg.data[0] = 1500;
+            motor_output_msg.data[1] = 1500;
+            motor_output_msg.data[2] = 1500;
+            motor_output_msg.data[3] = 1000;   // 추력도 끊는다 — 플래그의 뜻이 "완전 정지"다
+            motor_pub_->publish(motor_output_msg);
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "[PID Control] 완전 정지 — 서보 1500 고정, 추력 1000 (PID 건너뜀, 센서만 측정)");
+            return;
+        }
+
         // PID 연산 구역
         // 주의: dt를 곱하지 않는 형태다. 제어 주기가 100Hz로 일정하다는 전제 아래
         //       dt를 게인에 흡수시킨 구현이며, I항은 단순 누산 / D항은 단순 차분이다.
@@ -437,6 +465,7 @@ private:
 
     int16_t rc_roll_, rc_pitch_, rc_throttle_;                   // 수동 목표값 (0.1도 / 스틱 raw)
     int16_t auto_roll_, auto_pitch_, auto_throttle_;             // 자동 목표값 (0.1도 / PWM)
+    bool    auto_hold_;                                          // /auto/command z — 서보 고정(완전 정지)
 
     bool is_auto_mode_;
 
