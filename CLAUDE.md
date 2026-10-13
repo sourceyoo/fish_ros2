@@ -62,19 +62,23 @@ I2C sensors ──▶ i2c_driver_node ──▶ /raw/magnetometer ──▶ stat
 ```
 
 `rpm_driver_node` is independent: GPIO 21 rising-edge interrupts → `/sensor/tail_rpm`.
+Not drawn: `auto_scenario_node` also publishes **`/auto/state`** (Int32, 0 IDLE / 1 WAIT / 2 RUN, 100 Hz,
+since 2026-09-16), read by `hydro_estimator_node` (wait-window wet zero) and `data_logger_node` (`State` column);
+`hydro_estimator_node` additionally reads `/raw/imu_6dof` for the stillness test. `i2c_driver_node` → `/raw/imu_mpu9250`
+(second IMU, monitoring) → `data_logger_node` only.
 
 ### Node roles
 
 | Node | Owns |
 |---|---|
 | `uart_bridge_node` | `/dev/ttyAMA0` 115200 8N1. Byte-level packet state machine. **Pure pass-through — no scaling, no sign flips.** |
-| `i2c_driver_node` | `/dev/i2c-1`: AK8963 magnetometer (via MPU9250 bypass) + 3× MS5837 behind a TCA9548A mux |
+| `i2c_driver_node` | `/dev/i2c-1`: AK8963 magnetometer (via MPU9250 bypass) + 3× MS5837 behind a TCA9548A mux. **Since 2026-09-16 it also reads the MPU9250's own 6-axis + chip temperature** → `/raw/imu_mpu9250` (Float32MultiArray[7]: accel g, gyro °/s, °C; ±4 g / ±500 °/s, DLPF 41 Hz; **rotated into the nRF IMU's chip axes** by the measured signed permutation `nRF = (−MPU_y, +MPU_z, −MPU_x)` so CSV columns 24–29 and 56–61 subtract directly — **monitoring only**, nothing but `data_logger_node` reads it; failed read = NaN×7; WHO_AM_I probed once at init like the AK8963) |
 | `state_estimation_ekf_node` | MEKF filter, button UI, yaw offset, ±5000 mode encoding, mag calibration via `magneto_cal.py`. The "brain" — sole publisher of `/filtered/attitude`. **Pressure left this node on 2026-08-21** — it never entered the filter state; it was inherited furniture from the Mahony migration. |
-| `pid_control_node` | PID + motor mixing. Output `[0]=left servo, [1]=right servo, [2]=yaw servo, [3]=tail BLDC`. **No yaw control since 2026-09-14 (operator decision)**: `[2]` is fixed at 1500 (center), the yaw stick and `/auto/command` z are ignored, and the `kp/ki/kd_yaw` and `servo_reverse_yaw` parameters no longer exist. Roll/pitch mixing never used yaw, so the fins are unaffected. |
-| `auto_scenario_node` | Time-based trajectory generator for AUTO mode. A scenario is a **step table** (duration + roll/pitch/thrust per step); adding one means adding a table in `build_steps()`. Five exist: `straight` (default — level, 40 %, 4 s since 2026-09-15), `dive`, `climb`, `porpoise`, `attitude` (thrust 0, bench servo check). **`turn` was removed with yaw control on 2026-09-14** — naming it is rejected as unknown, and `/auto/command` z is always 0. Selected by the `scenario` parameter with `run_sec` / `throttle_pct` / `angle_deg` / `start_delay_sec`; **all are latched at AUTO entry**, so a param change applies on the next entry, not mid-run or mid-wait. **AUTO entry waits `start_delay_sec` (default 5 s, since 2026-09-15) before the scenario starts** — thrust 0 and level during the wait, `run_sec` counts from the end of the wait, and leaving AUTO during the wait cancels it. Every scenario cuts thrust at `run_sec`. |
+| `pid_control_node` | PID + motor mixing. Output `[0]=left servo, [1]=right servo, [2]=yaw servo, [3]=tail BLDC`. **No yaw control since 2026-09-14 (operator decision)**: `[2]` is fixed at 1500 (center), the yaw stick is ignored, and the `kp/ki/kd_yaw` and `servo_reverse_yaw` parameters no longer exist. **`/auto/command` z is no longer dead — since 2026-09-16 it is the servo-hold flag** (≥ 0.5 in AUTO ⇒ skip the PID, emit `[1500,1500,1500,1000]`, and clear the integral/derivative state so the freeze cannot wind up); it is not a yaw target, and MANUAL ignores it. Roll/pitch mixing never used yaw, so the fins are unaffected. |
+| `auto_scenario_node` | Time-based trajectory generator for AUTO mode. A scenario is a **step table** (duration + roll/pitch/thrust per step); adding one means adding a table in `build_steps()`. Eight exist: `straight` (default — level, 40 %, 3 s since 2026-09-16), `dive`, `climb`, `porpoise`, `attitude` (thrust 0, bench servo check), `static` (2026-09-16 — **full stop**: sets the `hold` flag on its Step, which becomes `/auto/command` z = 1 and makes `pid_control_node` skip the PID entirely and emit `[1500,1500,1500,1000]`; thrust 0 + level targets are NOT enough, because any tilt still produces an error the PID acts on — measured under a 10° tilt: `straight` drove the servos to 1412, `static` held 1500. For sensor-only baselines: depth drift, gyro bias, and validating the wait-window wet zero, where `Speed_wz` must read ~0. **Since 2026-10-01 it is also the one open-ended scenario**: its Step sets `open_ended`, so the run loop skips the `run_sec` test entirely and it keeps measuring until btn1 returns to MANUAL — pre-deciding a measurement length and editing a parameter per run did not match how it is actually used (09-30 operator run). The measured stretch is the CSV rows with `State` = 2), and `bank_left` / `bank_right` (roll ∓`angle_deg`, pitch 0, thrust on — bank turn with the yaw servo still fixed; roll sign bench-measured 2026-09-16: **− = left, + = right**; whether/which way it actually turns is unverified in water — read the turn from CSV `Yaw`, + = left/CCW). **`turn` was removed with yaw control on 2026-09-14** — naming it is rejected as unknown, and `/auto/command` z carries the servo-hold flag instead of a yaw target. **`scenario` has flipped between measurement and driving three times on operator request** — pinned to `static` 2026-10-01, back to `straight` 2026-10-03, **back to `static` 2026-10-05 (current)**. Only that one default string moves; no scenario code changed any time. `combo_list` is a separate default and currently still holds the driving list `"straight,dive,bank_left,bank_right"`, so **a combo press leaves `static` and starts driving** — pin it with `combo_list "static"` if the combo button must not do that. Drive again with `ros2 param set /auto_scenario_node scenario straight`. Selected by the `scenario` parameter with `run_sec` / `throttle_pct` / `angle_deg` / `start_delay_sec`; **all are latched at AUTO entry**, so a param change applies on the next entry, not mid-run or mid-wait. **AUTO entry waits `start_delay_sec` (added 2026-09-15; default raised 5 → 10 s on 2026-09-19 so the wet zero gets a still stretch — the robot spends the first 4–5 s sinking) before the scenario starts** — thrust 0 and level during the wait, `run_sec` counts from the end of the wait, and leaving AUTO during the wait cancels it. Every scenario cuts thrust at `run_sec` **except an open-ended one** (`open_ended` on its Step — only `static` today), which ignores `run_sec` and ends when the operator leaves AUTO. Publishes `/auto/state` every tick (0 IDLE incl. MANUAL and after `run_sec`, 1 during the wait, 2 while running). |
 | `rpm_driver_node` | Hall-sensor pulse counting in a worker thread |
-| `hydro_estimator_node` | **Owns pressure end to end** (new 2026-08-21): atmospheric zeroing, `/sensor/pressure_calibrated`, btn1 long-press re-zero, and depth in metres on `/filtered/hydro`. Speed (pitot) is the next stage — those array slots publish NaN today. Observation-only; no control loop consumes it. |
-| `data_logger_node` | 39-column CSV snapshot at 100 Hz — fused attitude **plus raw IMU/mag/pressure and EKF gyro bias + flags** (post-hoc diagnosis; raw mag enables offline recalibration, raw pressure enables offline depth/pitot recomputation). 200 MB per-file rotation, `Time(s)` continuous across files. Schema: `docs/csv_format.md`. |
+| `hydro_estimator_node` | **Owns pressure end to end** (new 2026-08-21): atmospheric zeroing, `/sensor/pressure_calibrated`, btn1 long-press re-zero, and depth in metres on `/filtered/hydro`. Speed (pitot) is implemented (air-Δb or `/hydro/zero_q` zero, LPF, deadband) but **the air zero is void once wet** — channels drift 0.3–0.6 mbar apart, leaving +0.3–0.4 m/s at rest (0913–0915 tank logs). Hence the **wait-window wet zero (2026-09-16)**: during the AUTO start delay (`/auto/state` = 1) it collects `q_raw − dP_hydro`, tests stillness per sample (1 s depth-rate regression < 5 mm/s AND raw \|gyro\| 1 s mean < 5 °/s), and at the WAIT→RUN edge takes the median of the **latest** ≥ 2 s still run (src 1), else the last 2 s (src 2), else zero 0 (src 0). Published as slots [8..14] of `/filtered/hydro` (`q_wz`, `speed_wz` unfiltered, per-sample); the old `speed`/`q` slots are untouched for comparison. Thresholds `wet_zero_*` are live-settable (latched at WAIT entry). Observation-only; no control loop consumes it. |
+| `data_logger_node` | 63-column CSV snapshot at 100 Hz (47 before 2026-09-16; then 8 wet-zero fields + `State`, 7 MPU9250 columns `MPU_*`, and since 2026-10-07 `Epoch(s)` — the UTC unix time of each row, ms precision, read straight from `CLOCK_REALTIME`. `Time(s)` stays the monotonic logger-start clock and is what every duration/rate calculation must use; `Epoch(s)` exists only to put the log on the same timeline as gear outside the robot (e.g. a tow rig whose filename carries `YYYYMMDD_HHMMSS`), since a wall clock can step backwards on an NTP correction. `Epoch − Time(s)` is constant across the 200 MB rotation (measured jitter 0.0 ms), which filename-based back-calculation is not) — fused attitude **plus raw IMU/mag/pressure and EKF gyro bias + flags** (post-hoc diagnosis; raw mag enables offline recalibration, raw pressure enables offline depth/pitot recomputation). 200 MB per-file rotation, `Time(s)` continuous across files. Schema: `docs/csv_format.md`. |
 
 ## Conventions you must know before editing
 
@@ -86,6 +90,9 @@ There is no mode topic. `state_estimation_ekf_node` adds **±5000 to `attitude.x
 mode. Three nodes decode it independently with the same `|x| > 2500` test — `attitude_callback` in
 `pid_control_node.cpp`, `auto_scenario_node.cpp`, `data_logger_node.cpp`. Change the encoding in
 one place and you must change all four.
+Since 2026-09-16 there is also an explicit **`/auto/state`** Int32 (0 IDLE / 1 WAIT / 2 RUN) from
+`auto_scenario_node`; `hydro_estimator_node` and `data_logger_node` decode the same literals
+(`AUTO_STATE_*` enum copied in each file) — change all three together.
 
 ### 2. IMU units are **g** and **deg/s**, not REP-103
 
@@ -97,7 +104,8 @@ matter to them, only direction. **Any new consumer of this topic must convert.**
 ### 3. Message types are reused as plain containers
 
 - `/rc/command` is a `geometry_msgs/Quaternion` holding **4 raw stick ints**, not a rotation:
-  `x=roll, y=pitch, z=yaw, w=throttle`. Same for `/auto/command` (`x/y/z` in **0.1°**, `w` in **PWM µs**).
+  `x=roll, y=pitch, z=yaw, w=throttle`. Same for `/auto/command` (`x/y` in **0.1°**, `w` in **PWM µs**;
+  **`z` is the servo-hold flag since 2026-09-16**, 0 normally and 1 for the `static` scenario — not an angle).
   Measured full-stick ranges (2026-08-27): roll −272~+242, pitch −266~+251, **yaw only −85~+86**
   (1/3 the scale of roll/pitch — nRF-side mapping), throttle 0~+1171 (the code's 1171 constant is
   exact). Roll/pitch sticks map to target angle at ×0.1°/count in `pid_control_node`. **The yaw
@@ -180,12 +188,22 @@ upper clamp (covariance adjusts trust). §1.3.
   ripple, or EMI — those would be common-mode. Still 5–10× finer than the cm-level a depth loop
   needs, but it caps differential-pressure attitude: at 30 cm spacing 1° of pitch is only 0.51 mbar,
   so a single sample resolves ~0.3–0.5°. Quote the measured figure, never the datasheet one.
-- The three MS5837 sensors all share address `0x76`, hence the mux. Pressure updates at **~11 Hz**
-  despite the 100 Hz timer — a 3-state machine spreads the ADC conversions across ticks. **~11 Hz is
-  not a hardware floor**: the two waits are 40 ms each against an 18 ms datasheet max (OSR 8192), and
-  the three sensors convert concurrently, so the rate can roughly double with no resolution loss if
-  depth control ever needs it. The mux stagger between the three (~0.8 ms at 100 kHz) is the smallest
-  delay in the chain by 100×.
+- The three MS5837 sensors all share address `0x76`, hence the mux. Pressure updates at **~19.3 Hz**
+  (was ~11 Hz until 2026-09-19) despite the 100 Hz timer — a 3-state machine spreads the ADC
+  conversions across ticks, and the three sensors convert concurrently so the rate is independent of
+  channel count. Two changes bought the 1.75×, both **without touching OSR 8192 or the compensation**:
+  (1) **temperature is converted only every 10th cycle** (`TEMP_EVERY`), the D2 in between being the
+  last *successful* one — measured drift is 0.00–0.06 °C/min, i.e. 0.0005 °C over 0.5 s against a
+  0.01 °C LSB, while that second 40 ms wait was half the period; (2) the per-conversion wait went
+  40 → 30 ms (`CONV_TICKS=3`) against a 17.2 ms datasheet max, still 1.7× headroom. Noise is unchanged
+  (0.18/0.22/0.20 mbar at 19.3 Hz vs 0.14/0.25/0.21 at 11 Hz — same order, within per-unit spread).
+  **A skipped cycle reuses D2 only when `d2_ok[]` says the last collection succeeded**; a failed one
+  is zeroed so the conversion guard emits NaN — otherwise this would resurrect the "dead sensor keeps
+  publishing its last value" trap. `hydro_estimator_node` hardcoded 11 Hz in five places (LPF `dt`,
+  deadband σ, q-window sizing, collection-time logs, the 5 s negative-q streak); they now read one
+  `PRESS_HZ` constant — **change the driver and you must change that too**, or the LPF time constant
+  and deadband threshold shift silently. The mux stagger between the three (~0.8 ms at 100 kHz) is the
+  smallest delay in the chain by 100×.
 - **`/sensor/pressure_raw` is truly raw — permanently, by decision (2026-08-26).** The driver's
   1st-order IIR (α 0.1, τ ≈ 0.86 s) was bypassed on 2026-08-19 for characterization and the bypass
   is now the spec: restoring it would insert ~860 ms of unmodeled group delay under
@@ -218,6 +236,8 @@ upper clamp (covariance adjusts trust). §1.3.
   probes MPU9250 (0x68, bypass) and AK8963 once at init and never retries, so a loose **J4**
   connector (disturbed during the pressure-sensor swap) gives one boot-time WARN and silent 6-DOF.
   Diagnostic: `i2cget -y 1 0x68 0x75` must answer `0x71`; fix = reseat J4, then restart the node.
+  The MPU9250 6-axis monitor (2026-09-16) sits on the same J4 and follows the same once-at-init probe,
+  so a loose J4 also means `MPU_*` columns stay NaN for that whole run.
 - **Axis remap `(my, mx, −mz)` is verified and PERMANENT** (tumble 2026-08-06, dip 144.3° vs Korea's
   143°); the code comment's derivation is bogus but the answer is measured — do not reopen (§4.2).
 - **Ellipsoid fit only; min/max retired 2026-08-17** — it measured *worse than no calibration*
@@ -274,7 +294,7 @@ re-zero). **The scenario only advances at exactly 300 ticks of both being down**
 `/ui/scenario_next`; a shorter combo does nothing but still suppresses, and logs how long it was held
 (report the *peak* tick count, not the live counter — the counter resets the instant either button
 lifts, which made a 2 s press report "0.0초"). `auto_scenario_node` steps through `combo_list`
-(default `straight,dive`) on that signal. **The latch clears only when BOTH are released** — the two
+(default `straight,dive,bank_left,bank_right` — pinned to `"static"` alone from 2026-10-01, restored 2026-10-03) on that signal. **The latch clears only when BOTH are released** — the two
 releases were measured 0.1 s apart, and clearing on the first would let the later one fire its own
 action. Combo detection lives in `state_estimation_ekf_node` (which must suppress anyway) plus a
 small guard in `hydro_estimator_node`; don't scatter a third copy. The combo does **not** change mode —
@@ -323,12 +343,12 @@ It carries the water-vs-bench split, the "must be done before water" items, and 
 |---|---|
 | AK8963 ASA ROM (0x10–0x12) never read | \|m\| reads 30 % low (35.8 vs ~50 µT, 2026-08-25). Magnitude-only — heading/attitude unaffected; fixing it forces recalibration. §4.1 |
 | Thermal drift near the sensor | 3 µT (≈8° heading) after CPU load, noise ~×3 — may cap accuracy. §4.7 |
-| Gyro z bias session-unstable | −0.044 vs −2.2 °/s hours apart (50×); the EKF absorbs it online. §3.2 |
+| Gyro z bias session-unstable | −0.044 vs −2.2 °/s hours apart (50×); the EKF absorbs it online. §3.2. **Since 2026-09-16 the MPU9250's own gyro + temperature are logged (`MPU_G*`, `MPU_T`) as an independent reference** — same true rotation, independent bias, so a widening difference marks a bias jump. The driver already rotates it into the nRF chip axes (permutation measured 2026-09-16 by pairing the two gravity vectors at rest: det +1, residual 0.96°; the gyro uses the accel-derived permutation — not yet confirmed by a rotation test; re-measure if the nRF IMU is remounted). Bench at rest 2026-09-16, nRF axes: nRF (+0.15, −3.16, −0.50) vs MPU (+2.51, −0.33, −1.07) °/s, MPU 38 °C. |
 | `gyro_noise_sigma` validated 2026-08-17 | Allan (2 h, 711k samples): ARW 0.0060–0.0078 °/s/√Hz, bias instability 0.0011–0.0024 °/s at τ 69–434 s. The 0.05 setting is a measured 6.4–8.3× headroom, no longer a guess; `bias_tau` 1000 s and `gyro_bias_rw_sigma` 0.002 are consistent. §3.3 |
 | **Positive pitch = nose DOWN** | opposite of aerospace convention (measured 2026-08-04). Confirm signs before touching the pitch PID or AUTO scenario. §2.1 |
 | Roll/pitch have no offset calibration | **Roll** shows a stable +6.4° over a 3.87-day bench record — that looks like a genuine mounting offset. **Pitch does not**: the "≈ 7.9°" from 2026-08-04 (§2.1) did not reproduce — the same 3.87 days averaged **−0.45°** (range −1.03 … +0.38) and another day read +5.83°. Resting pitch depends on how the robot is set down, so **do not treat 7.9° as a constant**. `hydro_estimator_node` used it as an attitude fallback until 2026-08-25; that fallback is gone (speed is NaN without attitude). |
 | Post-assembly tests pending | tail-beat pitch bias, PID sign bench check **before water**. §8.2 (multi-attitude tilt PASSED 2026-08-27: all six poses ≤ 0.61° vs gravity, incl. pitch ±89°, §11.2) |
-| `data_logger_node` total log volume unbounded | ~84 MB/hour since raw pressure columns (2026-08-21; ~80 MB since 2026-08-18). Per-file 200 MB rotation exists, but old files are never deleted (deliberate — `log_csv/` also holds the experiment CSVs; the calibration files now live in `config/`). Disk space is managed by hand. |
+| `data_logger_node` total log volume unbounded | ~84 MB/hour since raw pressure columns (2026-08-21; ~80 MB since 2026-08-18), about +10 MB/hour more since the 8 wet-zero columns and +~15 MB/hour since the 7 MPU9250 columns (both 2026-09-16). Per-file 200 MB rotation exists, but old files are never deleted (deliberate — `log_csv/` also holds the experiment CSVs; the calibration files now live in `config/`). Disk space is managed by hand. |
 
 ## Language
 

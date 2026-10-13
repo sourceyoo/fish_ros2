@@ -2,7 +2,7 @@
 
 전원을 켜고, 확인하고, 보정하고, 물에 넣고, 꺼내서 정리하기까지의 전 절차.
 로그 문구는 전부 **실제 기동 기록**에서 그대로 옮긴 것이다 (최종 대조 2026-08-26).
-최근 개정 2026-09-15: 요 제어 제거(요 서보 중앙 고정), AUTO 진입 후 5초 대기·4초 주행, 7장 `ros2 param` 신설,
+최근 개정 2026-10-01: **AUTO 진입은 당분간 무조건 `static`**(완전 정지 측정, MANUAL 로 나올 때까지). AUTO 진입 후 **10초 대기**(물속 영점 확보용)·3초 주행·추력 40 %, 뱅크 선회(bank_left/bank_right)·완전 정지(static) 시나리오, 7장 `ros2 param` 신설,
 실험 전 복각 점검 `dip_check.py` 신설 (D.3).
 설계 근거와 측정 이력은 `CLAUDE.md`와 `docs/imu_detailed.md`, 남은 작업은 `docs/todo.md`.
 
@@ -16,9 +16,9 @@
 
 | | **짧게** (0.04~1초, "톡") | **3초** (정확히 3초에 1회 발동) |
 |---|---|---|
-| **btn1** | **AUTO / MANUAL 전환** (AUTO 는 **5초 뒤 출발**, 4초 주행) | **대기압 영점 재포착** — 공기 중 전용, 잠기면 거부 |
+| **btn1** | **AUTO / MANUAL 전환** (AUTO 는 **10초 뒤 시작**. 현재 기본은 `static` — 끝까지 측정, btn1 으로 종료) | **대기압 영점 재포착** — 공기 중 전용, 잠기면 거부 |
 | **btn2** | **현재 방향을 yaw 0°로** (헤딩 영점) | **지자기 보정 시작** (텀블 필요; 한 번 더 3초 = 조기 종료) |
-| **btn1+btn2 동시** | (아무 동작 없음 — 단독 동작만 억제) | **3초 유지 = AUTO 시나리오 전환** (`straight` ↔ `dive`) |
+| **btn1+btn2 동시** | (아무 동작 없음 — 단독 동작만 억제) | **3초 유지 = AUTO 시나리오 전환**. 현재 목록은 `static` 하나라 **눌러도 안 바뀐다** (7.3 에서 되돌리는 법) |
 
 - **1초를 넘기고 3초가 안 되면 아무 일도 없다** — 짧지도 길지도 않은 구간은 무시된다.
 - 3초는 `== 300틱` 판정이라 계속 눌러도 한 번만 발동하고, 손을 뗄 때 짧은 누름으로 세지 않는다.
@@ -89,6 +89,7 @@ journalctl -u fish-robot -b | head -80      # 또는 --since "-5min"
 ### ✅ 정상일 때 (2026-08-26 실기록)
 
 ```
+[INFO] [MPU9250] 6축 감시 켜짐 (±4 g / ±500 도/초, DLPF 41 Hz, 100 Hz 발행 /raw/imu_mpu9250, nRF IMU 칩 축으로 회전).  ← 2026-09-16
 [INFO] [AK8963] 지자기 센서 정상 연결 확인 (100Hz).
 [INFO] [MS5837] 채널 0 (J5 커넥터) 압력센서 롬 로드 완료.        ← 0,1,2 전부
 [INFO] [포트] front(ch0) 확인
@@ -161,6 +162,7 @@ journalctl -u fish-robot -b | head -80      # 또는 --since "-5min"
 | 헤딩 영점 | 선택 (요 제어 없음, 로그용) | btn2 짧게 | 출발 방향 보고 |
 | 지자기 (타원체) | **부품이 바뀌었을 때만** | btn2 3초 + 텀블 | 강철 1 m 밖 |
 | 물속 q 영점 | **선택** — 정지 속도 오차가 보일 때만 | `/hydro/zero_q` 서비스 | 물속 15 cm+ |
+| 대기창 물속 영점 (속도) | **매 AUTO 주행 자동** (2026-09-16) | 별도 조작 없음 — 넣고 손 뗀 뒤 2초+ 가만히 (4.3) | 물속, 정지 |
 
 ### 3.2 지자기 보정 — 텀블이 필요하다 (btn2 3초)
 
@@ -180,8 +182,8 @@ journalctl -u fish-robot -b | head -80      # 또는 --since "-5min"
 [INFO] [EKF] 지자기 캘리브레이션 성공 — 새 보정 즉시 적용
 ```
 
-**안전장치**: 흩어짐 8 % 초과면 저장을 거부하고 기존 파일을 지킨다. **평평한 스핀만
-돌리면 안 된다** (수직 오프셋을 못 본다). **보정은 장소가 아니라 어셈블리에 묶인다** —
+**안전장치**: 흩어짐 8 % 초과면 저장을 거부하고 기존 파일을 지킨다.
+**평평한 스핀만 돌리면 안 된다** (수직 오프셋을 못 본다). **보정은 장소가 아니라 어셈블리에 묶인다** —
 부품을 하나라도 바꾸면 무효 (실측: 조립 변경마다 하드아이언이 통째로 바뀌었다).
 현재 보정: 2026-09-14 18:41, 흩어짐 5.0 %. 굴린 자리가 교란돼 텀블 복각이 168.5° 로 나왔다.
 깨끗한 자리에서 켠 22:00 기동은 142.1° 였지만, **2026-09-15 에 자세를 바꿔 보니 복각이 자세마다 달랐다** —
@@ -199,8 +201,8 @@ EKF 가 나침판을 계속 버렸다. **좋은 보정은 모든 자세에서 �
 - 하우징을 열었다 닫았을 때 · 지자기 텀블 직후 · 오래 켜둬서 날씨로 기압이 변했을 때
   (시간당 1~2 hPa = 수심 1~2 cm)
 
-재영점은 웜업을 건너뛰고 **즉시 9초 수집**한다. 성공하면 **공기 Δb(속도 영점)도 자동으로
-같이 채워진다** — 속도를 위한 별도 조작은 없다.
+재영점은 웜업을 건너뛰고 **즉시 9초 수집**한다.
+성공하면 **공기 Δb(속도 영점)도 자동으로 같이 채워진다** — 속도를 위한 별도 조작은 없다.
 
 **물에 잠긴 채 누르면 거부된다** (게이지압 5 mbar ≈ 5 cm 초과):
 ```
@@ -248,6 +250,7 @@ ros2 param set /pid_control_node servo_reverse_left true    # 또는 right, true
 ### 4.2 수심·속도 읽기
 
 `/filtered/hydro` = `[수심 m, 속도 m/s, q, q_raw, dP_hydro, 정압 게이지, 사용한 pitch, 플래그]`
++ 뒤 7칸은 대기창 물속 영점 (2026-09-16: 영점, 출처, 구간 시작·끝 나이, 정지 판정, q_wz, speed_wz).
 
 - **플래그 정상값 0x01F** (수심·속도 유효 + 두 영점 + 자세 신선). 비트별 뜻은 `docs/csv_format.md`
 - **공기 중에서 속도가 −0.6 m/s쯤 나오는 것은 알려진 인공물** — dP_hydro가 물 밀도를
@@ -255,14 +258,33 @@ ros2 param set /pid_control_node servo_reverse_left true    # 또는 right, true
 - 물속 정지 상태에서 Speed가 0이 아니면 그 크기가 곧 기하 모델 오차다 — 크면(>0.1 m/s)
   물속 q 영점을 잡는다: 로봇을 물속에 **정지**시키고
   `ros2 service call /hydro/zero_q std_srvs/srv/Trigger` (3초 수집, 흐름·꼬리 정지 필수)
+- **AUTO 주행의 속도는 `Speed`(41열) 대신 `Speed_wz`(54열)를 본다** (2026-09-16). 공기 중 영점은
+  젖으면 채널마다 흘러 정지 상태에서 +0.3~0.4 m/s 가 남는다(0913~0915 수조 로그). `Speed_wz` 는
+  AUTO 진입 대기 중에 잡은 **그 주행의 영점**을 뺀 값이다 — 4.3 "대기 중 물속 영점".
 
 ### 4.3 AUTO 모드 (🎮 btn1 짧게)
 
-기본 시나리오(2026-09-15 변경, 종전 6초, 그 전 20 %·8초): **수평 자세로 추력 40 %(PWM 1400), 4초 전진 후 정지.**
-자세는 전 구간 roll/pitch 0°를 지시하고(요는 제어하지 않는다), 4초가 지나면 추력만 1000으로 끊는다.
-**AUTO 에 들어가면 5초 기다렸다가 시작한다** (2026-09-15, `start_delay_sec`). 기다리는 동안은
-추력 0 에 수평만 지시하고, 4초는 대기가 끝난 순간부터 센다. 대기 중 btn1 으로 MANUAL 에 나가면
-취소되고, 다시 들어오면 처음부터 5초를 기다린다.
+기본 시나리오(2026-09-16 주행 3초로, 09-15 4초·40 %, 종전 6초, 그 전 20 %·8초): **수평 자세로 추력 40 %(PWM 1400), 3초 전진 후 정지.**
+자세는 전 구간 roll/pitch 0°를 지시하고(요는 제어하지 않는다), 3초가 지나면 추력만 1000으로 끊는다.
+어떤 시나리오든 `run_sec` 이 지나면 추력을 끊고 멈춘다. **예외는 `static`** — 그것만
+`run_sec` 을 무시하고 MANUAL 로 나올 때까지 계속한다 (2026-10-01).
+
+**AUTO 에 들어가면 10초 기다렸다가 시작한다** (2026-09-15 신설, 09-19 에 5 → 10초, `start_delay_sec`).
+기다리는 동안은 추력 0 에 수평만 지시하고, 3초는 대기가 끝난 순간부터 센다. 대기 중 btn1 으로
+MANUAL 에 나가면 취소되고, 다시 들어오면 처음부터 10초를 기다린다. **10초인 이유는 아래 물속 영점** —
+로봇이 가라앉아 자리 잡을 시간(4~5초)에 정지 2초와 여유를 더한 값이다.
+
+**대기 중 물속 영점 (2026-09-16).** 이 대기 동안 `hydro_estimator_node` 가 로봇이 조용한 구간의
+동압을 그 주행의 속도 영점으로 잡는다 — 수심 변화 < 5 mm/s 이고 자이로 < 5 °/s 인 상태가
+**2초 이상** 이어진 구간 중 가장 늦은 것의 중앙값. 그런 구간이 없으면 대기 마지막 2초로 폴백한다.
+결과는 저널에 `[Hydro] 대기창 영점 확보: X mbar (정지 구간 …)` 또는 `(**폴백** …)` 으로 남고,
+CSV 49열 `Zero_src` 가 1(정지) / 2(폴백) / 0(없음) 이다.
+- 버튼을 누른 뒤 손으로 넣는 구조라 **버튼 직후 4~5초는 가라앉는 중**이다(0915 실측 14~21 mm/s).
+  5초로는 정지 2초가 안 잡혀 폴백이 잦았다 — **그래서 2026-09-19 부터 기본 대기가 10초다.**
+  그래도 폴백(`Zero_src`=2)이 계속되면 `wet_zero_still_gyro_dps` 를 7.0 으로 완화한다 (7.3).
+- 넣고 나서 **손을 떼고 2초 이상 가만히** 둔다. 잡고 있으면 그 손떨림이 영점에 들어간다.
+- 주행마다 새로 잡는다 — 꺼냈다 넣으면 영점이 바뀌기 때문이다. 종전 `Speed`(공기 영점)도 그대로
+  기록되므로 둘을 비교할 수 있다 (`docs/csv_format.md` 48~55열).
 **다시 달리려면 btn1 으로 MANUAL 로 나갔다가 AUTO 로 재진입**한다(진입 순간 스톱워치가
 0으로 리셋된다). 종전의 6초 주기 피치 ±10° 왕복은 물속 첫 검증을 위해 걷어냈다 —
 자세를 흔들면 추력 문제인지 자세 문제인지 가릴 수 없기 때문이다.
@@ -277,8 +299,37 @@ ros2 param set /pid_control_node servo_reverse_left true    # 또는 right, true
 | `climb` | 코를 `angle_deg` 만큼 위로 하고 전진 |
 | `porpoise` | 3초마다 피치 ±10° 왕복하며 전진 (`run_sec` 을 늘려 쓸 것) |
 | `attitude` | 추력 0 으로 피치 ±10° 왕복 — 벤치에서 서보만 볼 때 |
+| `bank_left` | 롤을 `angle_deg` 만큼 **왼쪽**으로 기울인 채 전진 — 뱅크 선회 (2026-09-16) |
+| `bank_right` | 같은 것을 **오른쪽**으로 |
+| `static` | **완전 정지** — 서보 3개 1500 고정, 추력 0. 구동 없이 센서만 측정. **`run_sec` 무시 — MANUAL 로 나올 때까지 계속** (2026-09-16, 10-01 지속형으로) |
 
 `turn`(헤딩 틀기)은 2026-09-14 요 제어 제거와 함께 없앴다 — 지정하면 모르는 시나리오로 거부된다.
+
+**완전 정지 (`static`, 2026-09-16).** 구동을 완전히 끊고 압력·IMU 만 재는 시나리오다. 서보 3개가
+1500 에, 꼬리가 1000 에 못박히고 **PID 가 통째로 멈춘다**.
+
+- **왜 "추력 0, 롤·피치 0" 으로는 안 되나**: 목표가 0 이어도 로봇이 조금만 기울면 오차가 생기고
+  PID 가 그 오차만큼 지느러미를 움직인다. 실측(10° 기울인 상태): `straight` 는 서보가 1412 로
+  88 µs 움직였고, `static` 은 1500 그대로였다.
+- 쓰임: 물속 **수심 드리프트**, 자이로 바이어스, 그리고 **대기창 물속 영점 검증** — 완전 정지이니
+  `Speed_wz`(54열)가 0 근처여야 맞다. 크게 나오면 영점이 잘못 잡힌 것이다.
+- **길이는 사람이 정한다 (2026-10-01).** `run_sec` 을 보지 않고 **btn1 으로 MANUAL 에 나올 때까지**
+  계속 측정한다. 원하는 만큼 두었다가 btn1 을 짧게 누르면 끝난다 — 몇 초 잴지 미리 정해 파라미터를
+  바꿔가며 실험하는 게 실제 운용과 맞지 않아서 바꿨다(09-30 실기).
+  저널에 `시작! 'static' — btn1 으로 MANUAL 에 나올 때까지 계속 측정합니다` 가 뜨고,
+  2초마다 `%.1f초 경과` 가 찍힌다. **측정 구간은 CSV `State`(55열)가 2 인 구간**이다:
+  `awk -F, '$55==2' fish_log_*.csv`
+- 구현: `/auto/command` 의 z 칸(요 제거로 비어 있던 자리)을 **서보 고정 플래그**로 쓴다.
+  1 이면 `pid_control_node` 가 PID 를 건너뛰고 `[1500,1500,1500,1000]` 을 낸다. 요 목표가 아니다.
+- 기본 `combo_list` 에는 없다. 버튼으로 돌리려면
+  `ros2 param set /auto_scenario_node combo_list "straight,static"` 처럼 넣는다.
+
+**뱅크 선회 (`bank_*`, 2026-09-16).** 요 서보는 그대로 1500 고정이고, 좌우 지느러미로 몸을 기울여 돈다
+(물고기·비행기의 방식). 롤 부호는 벤치 실측으로 확정: **롤 − = 왼쪽, 롤 + = 오른쪽** (좌로 기울여 −34.5°,
+우로 +40.5°). 물속에서 확인할 것 두 가지 — ① 기울이면 실제로 휘는가, ② 어느 쪽으로 휘는가.
+회전량은 CSV 7열 `Yaw` 로 잰다(**양수 = 좌선회**, 반시계): `State`(55열)가 2 인 구간의 끝 Yaw − 시작 Yaw.
+`bank_left` 인데 Yaw 가 음수로 가면 기운 반대쪽으로 도는 것이니 이름을 바꿔야 한다. 추력이 있어야 돈다 —
+`throttle_pct` 0 으로는 기울기만 하고 안 휜다.
 
 **`angle_deg` 는 지느러미 각이 아니라 목표 자세다.** 지느러미는 *오차*에 비례해 꺾이고
 (`kp` 8.75 → 피치 오차 1° = 혼 1°), 혼의 한계는 **±20°** 다. 그래서 수평에서 출발할 때:
@@ -296,10 +347,11 @@ ros2 param set /pid_control_node servo_reverse_left true    # 또는 right, true
 #### 조종기로 전환 — **btn1+btn2 함께 3초** (2026-09-03 실기 확인)
 
 물가에서 노트북 없이 시나리오를 바꾸는 방법이다. 두 버튼을 **함께 3초** 유지하면
-`combo_list`(기본 `straight,dive`)를 한 칸 돈다.
+`combo_list`(**2026-10-01 현재 기본 `static` 하나** — 눌러도 바뀌지 않는다. 종전 기본은
+`straight,dive,bank_left,bank_right` 로 직진·잠수·좌선회·우선회를 돌았다)를 한 칸 돈다.
 
 ```
-btn1+btn2 함께 3초  →  시나리오 전환 (straight ↔ dive).  **모드는 바뀌지 않는다**
+btn1+btn2 함께 3초  →  시나리오 전환 (straight → dive → bank_left → bank_right → 처음).  **모드는 바뀌지 않는다**
 btn1 단독           →  AUTO 진입 — 그때 걸려 있는 시나리오가 실행된다
 ```
 
@@ -314,9 +366,9 @@ btn1 단독           →  AUTO 진입 — 그때 걸려 있는 시나리오가 
 
 ```
 [EKF] 두 버튼 동시 3초 — AUTO 시나리오 전환 신호를 보냈습니다.
-[AUTO] 시나리오 전환 -> 'dive'  (2/2)  4.0초 추력 40% 각도 15.0도
-[AUTO SCENARIO] AUTO 진입 — 5.0초 뒤 'dive' 시작  (4.0초, 추력 40%)
-[AUTO SCENARIO] 시작! 'dive'  4.0초  추력 40%
+[AUTO] 시나리오 전환 -> 'dive'  (2/4)  3.0초 추력 40% 각도 15.0도
+[AUTO SCENARIO] AUTO 진입 — 10.0초 뒤 'dive' 시작  (3.0초, 추력 40%)
+[AUTO SCENARIO] 시작! 'dive'  3.0초  추력 40%
 ```
 
 3초를 못 채웠을 때는 이렇게 남는다:
@@ -333,7 +385,7 @@ ros2 param set /auto_scenario_node scenario dive    # straight/dive/climb/porpoi
 ros2 param set /auto_scenario_node run_sec 5.0
 ros2 param set /auto_scenario_node throttle_pct 30.0
 ros2 param set /auto_scenario_node angle_deg 15.0
-ros2 param set /auto_scenario_node start_delay_sec 5.0    # 진입 후 대기(초). 0.0 = 즉시
+ros2 param set /auto_scenario_node start_delay_sec 10.0   # 진입 후 대기(초). 0.0 = 즉시
 # 숫자는 소수점을 붙일 것 — 5 처럼 정수로 쓰면 형식이 달라 거부된다
 # 그 다음 btn1 으로 MANUAL 로 나갔다가 AUTO 재진입
 ```
@@ -345,20 +397,20 @@ ros2 param set /auto_scenario_node start_delay_sec 5.0    # 진입 후 대기(�
 "무엇을 지시했나"가 한 값으로 확정되게 하기 위해서다. 저널에는 이렇게 찍힌다:
 
 ```
-[AUTO SCENARIO] AUTO 진입 — 5.0초 뒤 'dive' 시작  (5.0초, 추력 30%)
-[AUTO SCENARIO] 대기 중 — 'dive' 시작까지 5초       ← 1초마다
-[AUTO SCENARIO] 시작! 'dive'  5.0초  추력 30%
+[AUTO SCENARIO] AUTO 진입 — 10.0초 뒤 'dive' 시작  (5.0초, 추력 40%)
+[AUTO SCENARIO] 대기 중 — 'dive' 시작까지 10초      ← 1초마다
+[AUTO SCENARIO] 시작! 'dive'  5.0초  추력 40%
 ```
 
 파라미터는 **재시작하면 사라진다**(기본값으로 복귀). 고정하려면 소스 기본값을 바꿀 것.
 
-⚠️ **진입 5초 뒤 추력이 걸린다** — 물 밖에서 실수로 누르면 잊을 즈음 꼬리가 4초간 40 %로 돈다.
+⚠️ **진입 10초 뒤 추력이 걸린다** — 물 밖에서 실수로 누르면 잊을 즈음 꼬리가 3초간 40 %로 돈다.
 대기 중에는 조용해서 AUTO 에 들어가 있다는 걸 놓치기 쉽다.
 ESC 는 정상 동작이 확인된 부품이므로 **모터 전원이 붙어 있으면 정말로 돈다** —
 **규칙: 모터 전원을 연결할 때는 반드시 MANUAL 인지 먼저 확인할 것.**
 
 - **AUTO에서는 조종기가 꺼져도 멈추지 않는다** — 자율 주행의 정상 동작(설계 의도).
-  단 지금 시나리오는 시작 4초 뒤 스스로 추력을 끊으므로 폭주 위험은 그만큼 작다
+  단 지금 시나리오는 시작 3초 뒤 스스로 추력을 끊으므로 폭주 위험은 그만큼 작다
 - 나오기: btn1 짧게. **링크가 끊긴 AUTO에서 나오려면**:
   `pkill -f state_estimation_ekf_node` (2초 뒤 respawn 되며 MANUAL로 복귀) 또는 서비스 정지
 - AUTO 는 방위(요)를 지시하지 않는다 — 2026-09-14 요 제어 제거 이후 요 서보는 중앙 고정이다
@@ -409,6 +461,7 @@ nRF가 네 채널 `-9999`, 버튼 `255`, RSSI `-127`을 보낸다. PID는 즉시
 | 수심이 NaN | 영점 미포착 / 정압 채널 사망 | `/filtered/hydro` flags → `csv_format.md`의 진단 사다리 |
 | 물속에서 btn1 3초가 안 먹는다 | **정상** — 물속 대기압 영점 거부 | 물 밖에서 다시. 물속에서 필요한 건 `/hydro/zero_q` |
 | 속도가 NaN | 자세 없음 / 정체압 사망 / q 영점 없음 | flags 비트로 원인 특정 (`csv_format.md`) |
+| 물속 정지인데 `Speed` +0.3 m/s | 공기 영점이 젖어서 흘렀다 (정상 현상) | `Speed_wz`(54열)를 쓴다. `Zero_src`(49열)가 2/0 이면 대기가 짧다 → `start_delay_sec` 10 (4.3) |
 | 공기 중 속도 −0.6 m/s | 알려진 인공물 (4.2) | 무시 — 물에서 사라짐 |
 | 압력이 고정값으로 굳음 | I2C 버스 잠김 | `[I2C Driver] ... 버스 잠김 의심` 로그 |
 | 자세가 안 나옴 | nRF 무응답 | `timeout 5 cat /dev/ttyAMA0 \| wc -c` (정상 ≈ 23000/5초) |
@@ -462,7 +515,7 @@ ls -l /proc/*/exe 2>/dev/null | grep '(deleted)'
 | `pid_control_node` | **된다** | **즉시** — 다음 자세 샘플(10 ms 안). 실측: 설정 직후 1 ms 안에 서보 출력이 바뀜 |
 | `auto_scenario_node` | **된다** | **다음 AUTO 진입**부터 — 진입 순간에 값을 잠근다 (4.3) |
 | `state_estimation_ekf_node` | 안 된다 | 소스 기본값 또는 런치 파일 수정 → 빌드 → 재시작 |
-| `hydro_estimator_node` | 안 된다 | 소스 기본값 수정 → 빌드 → 재시작 |
+| `hydro_estimator_node` | **`wet_zero_*` 만 된다** (2026-09-16) | **다음 AUTO 진입**부터 — 대기 시작 순간에 잠근다. 나머지(`speed_k` 등)는 여전히 안 된다 |
 | `uart_bridge` · `i2c_driver` · `rpm_driver` · `data_logger` | 파라미터 없음 | — |
 
 ### 7.3 바꿀 수 있는 값
@@ -487,12 +540,33 @@ ls -l /proc/*/exe 2>/dev/null | grep '(deleted)'
 
 | 파라미터 | 형식 | 기본값 | 뜻 |
 |---|---|---|---|
-| `scenario` | 문자열 | straight | straight / dive / climb / porpoise / attitude |
-| `start_delay_sec` | 실수 | 5.0 | AUTO 진입 후 대기(초). 0.0 = 즉시 출발 |
-| `run_sec` | 실수 | 4.0 | 주행 시간(초). 대기가 끝난 순간부터 센다 |
+| `scenario` | 문자열 | **static** | straight / dive / climb / porpoise / attitude / bank_left / bank_right / static |
+| `start_delay_sec` | 실수 | 10.0 | AUTO 진입 후 대기(초). 0.0 = 즉시 출발. 물속 영점을 잡을 시간이다 |
+| `run_sec` | 실수 | 3.0 | 주행 시간(초). 대기가 끝난 순간부터 센다. **`static` 은 이 값을 무시한다** |
 | `throttle_pct` | 실수 | 40.0 | 추력 % (0~100). attitude 는 무시하고 0 |
 | `angle_deg` | 실수 | 15.0 | dive/climb 의 목표 피치(도). 나머지 시나리오는 안 씀 |
-| `combo_list` | 문자열 | straight,dive | btn1+btn2 3초가 돌아가며 고르는 목록 |
+| `combo_list` | 문자열 | **static** | btn1+btn2 3초가 돌아가며 고르는 목록. 하나뿐이라 지금은 전환이 없다 |
+
+> **2026-10-01: 기본값이 `static` 하나로 묶여 있다.** 운용자 요청으로 AUTO 진입이 무조건 완전 정지
+> 측정이 되게 해 둔 상태이고, **시나리오 코드는 전부 그대로 남아 있다.** 주행 시험으로 돌아가려면
+> 두 줄이면 된다(재시작하면 기본값으로 되돌아간다 — 영구히 바꾸려면 소스 기본값 수정):
+> ```bash
+> ros2 param set /auto_scenario_node scenario straight
+> ros2 param set /auto_scenario_node combo_list "straight,dive,bank_left,bank_right"
+> ```
+
+**`hydro_estimator_node`** — `wet_zero_*` 만 실행 중 바뀌고, 다음 AUTO 진입(대기 시작)부터 적용된다.
+나머지 파라미터(`speed_k`, `lever_x_m`, `atm_warmup_sec` …)는 "성공"이 떠도 안 먹힌다 (7.2).
+
+| 파라미터 | 형식 | 기본값 | 뜻 |
+|---|---|---|---|
+| `wet_zero_enable` | 불리언 | true | 대기창 물속 영점 켜기/끄기 |
+| `wet_zero_still_depth_rate_mm_s` | 실수 | 5.0 | 정지 판정: 수심 변화율 상한 [mm/s] (1초 선형회귀 기울기) |
+| `wet_zero_still_gyro_dps` | 실수 | 5.0 | 정지 판정: 원시 자이로 크기 1초 평균 상한 [도/초]. 폴백이 잦으면 7.0 |
+| `wet_zero_still_min_sec` | 실수 | 2.0 | 정지가 이어져야 하는 최소 시간 [초] |
+| `wet_zero_fallback_sec` | 실수 | 2.0 | 정지 구간이 없을 때 쓰는 대기 마지막 구간 [초] |
+| `wet_zero_min_samples` | 정수 | 5 | 폴백에 필요한 최소 샘플 수. 미만이면 영점 없음(0) |
+| `wet_zero_window_sec` | 실수 | 1.0 | 변화율·자이로 평균 창 [초], 0.2 이상 |
 
 ### 7.4 명령과 입력 규칙
 
@@ -542,7 +616,8 @@ journalctl -u fish-robot -b | head -80      # 기동 로그
 
 # 상태
 ros2 topic echo /filtered/attitude --once   # roll(±5000이면 AUTO), pitch, yaw
-ros2 topic echo /filtered/hydro --once      # [수심, 속도, q, q_raw, dP_hydro, 정압, pitch, flags]
+ros2 topic echo /filtered/hydro --once      # [수심, 속도, q, q_raw, dP_hydro, 정압, pitch, flags, + 대기창 영점 7칸]
+ros2 topic echo /auto/state --once          # 0 IDLE / 1 WAIT(진입 대기) / 2 RUN
 ros2 topic echo /rc/status --once           # [btn1, btn2, V1×100, V2×100, RSSI]
 ros2 topic echo /filtered/ekf_status --once # [10] = 플래그 (7 정상)
 
@@ -552,11 +627,12 @@ ros2 service call /hydro/zero_atm std_srvs/srv/Trigger  # 대기압 재영점 (�
 ros2 service call /hydro/zero_q  std_srvs/srv/Trigger   # 물속 q 영점
 
 # 런타임 파라미터 (빌드·재시작 불필요, 재시작하면 소실 — 7장)
-#   pid 는 즉시, auto_scenario 는 다음 AUTO 진입부터. EKF·hydro 는 "성공"이 떠도 안 먹힌다
+#   pid 는 즉시, auto_scenario·hydro(wet_zero_* 만) 는 다음 AUTO 진입부터. EKF 와 hydro 의 나머지는 "성공"이 떠도 안 먹힌다
 ros2 param set /pid_control_node kp_pitch 10.0
 ros2 param set /pid_control_node servo_reverse_right false
 ros2 param get /pid_control_node kp_pitch
-ros2 param set /auto_scenario_node start_delay_sec 5.0
+ros2 param set /auto_scenario_node start_delay_sec 10.0
+ros2 param set /hydro_estimator_node wet_zero_still_gyro_dps 7.0   # 대기창 정지 판정 완화
 ros2 param dump /auto_scenario_node
 
 # 빌드 — 반드시 워크스페이스 루트에서 (src/ 안에서 돌리면 조용히 아무것도 안 된다)
@@ -571,7 +647,8 @@ cd ~/ros2_ws && colcon build --packages-select fish_robot_pkg
 | `hydro flags` | **0x01F** (육상·물속 공통; 공기 중 Speed 값은 무시) |
 | `/rc/status` RSSI | **−60 ~ −80 dBm** (−127 = 링크 없음) |
 | 배터리 (실측 예) | V1 ≈ 23 V대, V2 ≈ 7.5 V대 — ÷100 해서 읽는다 |
-| `/filtered/attitude` 주기 | 100 Hz · `/sensor/pressure_raw` ~11 Hz · `/filtered/hydro` ~9-11 Hz |
+| `/filtered/attitude` 주기 | 100 Hz · `/sensor/pressure_raw` ~19 Hz · `/filtered/hydro` ~19 Hz (2026-09-19, 종전 11 Hz) · `/raw/imu_mpu9250` 100 Hz |
+| `MPU_T` (2번째 IMU 칩 온도) | **~38 °C** 벤치 (CPU 열). `MPU_*` 가 전부 nan 이면 J4 확인 후 재시작 (감시 전용 — 제어 무관). `MPU_A*`/`MPU_G*` 는 nRF IMU 축으로 회전돼 있어 `AX..GZ` 와 열끼리 비교 |
 
 ### C. 로그가 남는 곳
 
@@ -804,7 +881,7 @@ python3 $S/exp_b.py
 ### E. 관련 문서
 
 - `CLAUDE.md` — 설계 규약(±5000 인코딩, NaN 규약, 단위)과 하드웨어 특성
-- `docs/csv_format.md` — CSV 47열 정의, Hydro 플래그 비트, 속도 NaN 진단 사다리
+- `docs/csv_format.md` — CSV 62열 정의(48~55 대기창 영점, 56~62 MPU9250 2번째 IMU), Hydro 플래그 비트, 속도 NaN 진단 사다리
 - `docs/imu_detailed.md` — 전 측정 이력 (§10 = 2026-08-25 압력 기동·지자기 재보정)
 - `docs/todo.md` — 남은 작업 (ESC 아밍, 물속 검증, PID 물속 튜닝 등)
 
