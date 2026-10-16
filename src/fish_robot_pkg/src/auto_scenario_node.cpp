@@ -86,6 +86,18 @@
 //    attitude  추력 0 으로 피치 ±10° 왕복             ← 벤치에서 서보만 볼 때
 //    static    **완전 정지** — 서보 3개 1500 고정, 추력 0. 센서만 측정 (2026-09-16).
 //              **run_sec 을 무시하고 MANUAL 로 나올 때까지 계속한다** (2026-10-01)
+//    dive_1s   1.0초 수평 유지 뒤 angle_deg 로 **한 번에** 꺾는다 (2026-10-16, 핀 스텝 시험용)
+//    dive_hold 1.5초 angle_deg 뒤 hold_deg 로 바꾼다 (2026-10-16, 잠수->유지 시험용)
+//
+//  ── 핀 시퀀스 시나리오 (2026-10-16) ───────────────────────────────────────
+//  목적: 핀 각도를 **계단으로** 주어 그 응답을 보는 것. 외부 스크립트 없이 시나리오로 돌린다.
+//  pitch_open_loop(PID 파라미터)이 켜져 있으면 핀 = kp_pitch × 목표 pitch 라, 목표 pitch 의
+//  계단이 곧 **핀 각도의 계단**이 된다. 꺼져 있으면(피드백) 목표 자세의 계단이다.
+//    dive_1s   : 0~1.0초 피치 0  -> 1.0초~끝 피치 angle_deg   (개루프에서 핀 0 -> kp×angle)
+//    dive_hold : 0~1.5초 angle_deg -> 1.5초~끝 hold_deg        (개루프에서 핀 kp×angle -> kp×hold)
+//  두 단계의 합이 run_sec 과 같아 표가 되풀이되지 않는다. run_sec 이 계단 시각보다 짧으면
+//  뒷단계가 0.01초로 줄어 사실상 실행되지 않는다 — run_sec 을 계단 시각보다 길게 둘 것.
+//  hold_deg 는 CSV 열이 없다. Target_Pitch(71열)의 계단 뒤 값이 곧 hold_deg 다.
 //    bank_left  수평 피치로 롤을 angle_deg 만큼 **왼쪽**으로 기울여 전진   (2026-09-16)
 //    bank_right 같은 것을 **오른쪽**으로
 //
@@ -135,6 +147,7 @@
 #include <vector>
 #include <string>
 #include <cmath>
+#include <algorithm>
 
 // /auto/state 값. hydro_estimator_node·data_logger_node 가 같은 숫자로 해독한다 —
 // 바꾸면 세 파일을 같이 바꿔야 한다 (±5000 모드 규약과 같은 종류의 약속).
@@ -146,7 +159,8 @@ enum { AUTO_STATE_IDLE = 0, AUTO_STATE_WAIT = 1, AUTO_STATE_RUN = 2 };
 enum {
     SCEN_NONE = 0, SCEN_STRAIGHT = 1, SCEN_DIVE = 2, SCEN_CLIMB = 3,
     SCEN_PORPOISE = 4, SCEN_ATTITUDE = 5, SCEN_BANK_LEFT = 6,
-    SCEN_BANK_RIGHT = 7, SCEN_STATIC = 8
+    SCEN_BANK_RIGHT = 7, SCEN_STATIC = 8,
+    SCEN_DIVE_1S = 9, SCEN_DIVE_HOLD = 10
 };
 
 // 이름 -> ID. is_known_scenario() 와 **같은 목록이어야 한다**(모르는 이름은 0).
@@ -159,6 +173,8 @@ static int scenario_id_of(const std::string &s) {
     if (s == "bank_left")  return SCEN_BANK_LEFT;
     if (s == "bank_right") return SCEN_BANK_RIGHT;
     if (s == "static")     return SCEN_STATIC;
+    if (s == "dive_1s")    return SCEN_DIVE_1S;     // 2026-10-16 핀 스텝
+    if (s == "dive_hold")  return SCEN_DIVE_HOLD;   // 2026-10-16 잠수->유지
     return SCEN_NONE;
 }
 
@@ -195,6 +211,7 @@ public:
         run_sec_      = this->declare_parameter<double>("run_sec", 3.0);
         throttle_pct_ = this->declare_parameter<double>("throttle_pct", 40.0);
         angle_deg_    = this->declare_parameter<double>("angle_deg", 15.0);
+        hold_deg_     = this->declare_parameter<double>("hold_deg", 0.0);   // dive_hold 의 1.5초 이후 피치(도) (2026-10-16)
         start_delay_sec_ = this->declare_parameter<double>("start_delay_sec", 10.0);   // 5 -> 10 (2026-09-19, 대기창 영점 확보용)
         if (start_delay_sec_ < 0.0) {
             RCLCPP_WARN(this->get_logger(), "[AUTO] start_delay_sec %.1f 는 음수라 0 으로 둡니다", start_delay_sec_);
@@ -219,7 +236,7 @@ public:
                             r.successful = false;
                             r.reason = "모르는 시나리오: " + v +
                                        " (straight/dive/climb/porpoise/attitude/bank_left/bank_right/static"
-                                       " — turn 은 요 제어 제거로 없음)";
+                                       "/dive_1s/dive_hold — turn 은 요 제어 제거로 없음)";
                             RCLCPP_ERROR(this->get_logger(), "[AUTO] %s", r.reason.c_str());
                             continue;
                         }
@@ -236,6 +253,7 @@ public:
                     } else if (n == "run_sec")      run_sec_      = p.as_double();
                     else if (n == "throttle_pct")   throttle_pct_ = p.as_double();
                     else if (n == "angle_deg")      angle_deg_    = p.as_double();
+                    else if (n == "hold_deg")       hold_deg_     = p.as_double();
                     else if (n == "start_delay_sec") {
                         const double v = p.as_double();
                         if (v < 0.0) {
@@ -322,7 +340,8 @@ private:
         return s == "straight" || s == "dive" || s == "climb"
             || s == "porpoise" || s == "attitude"
             || s == "bank_left" || s == "bank_right"
-            || s == "static";
+            || s == "static"
+            || s == "dive_1s" || s == "dive_hold";
     }
 
     // ── 시나리오 정의 — 새 시나리오는 여기에 한 갈래 추가하면 끝난다 ──────
@@ -330,6 +349,12 @@ private:
         const double A = angle_deg_;
         // 칸 순서: {지속초, 롤, 피치, 추력%}
         if (scenario_ == "dive")     return {{run_sec_, 0.0,  A,   -1.0}};
+        // 핀 스텝 (2026-10-16): 1.0초 수평 -> angle_deg. 개루프면 핀 0 -> kp×angle_deg 로 한 번에 바뀐다.
+        if (scenario_ == "dive_1s")   return {{1.0, 0.0, 0.0, -1.0},
+                                              {std::max(run_sec_ - 1.0, 0.01), 0.0, A, -1.0}};
+        // 잠수->유지 (2026-10-16): 1.5초 angle_deg -> hold_deg.
+        if (scenario_ == "dive_hold") return {{1.5, 0.0, A, -1.0},
+                                              {std::max(run_sec_ - 1.5, 0.01), 0.0, hold_deg_, -1.0}};
         if (scenario_ == "climb")    return {{run_sec_, 0.0, -A,   -1.0}};
         if (scenario_ == "porpoise") return {{3.0, 0.0,  10.0, -1.0},
                                              {3.0, 0.0, -10.0, -1.0}};
@@ -523,7 +548,7 @@ private:
 
     // 설정값 (파라미터, 언제든 바뀔 수 있다)
     std::string scenario_;
-    double run_sec_, throttle_pct_, angle_deg_, start_delay_sec_;
+    double run_sec_, throttle_pct_, angle_deg_, start_delay_sec_, hold_deg_;
     std::vector<std::string> combo_list_;   // 조합 누름이 순환할 시나리오 목록
     size_t combo_idx_ = 0;
 
