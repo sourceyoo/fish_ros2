@@ -2,7 +2,7 @@
 
 전원을 켜고, 확인하고, 보정하고, 물에 넣고, 꺼내서 정리하기까지의 전 절차.
 로그 문구는 전부 **실제 기동 기록**에서 그대로 옮긴 것이다 (최종 대조 2026-08-26).
-최근 개정 2026-10-01: **AUTO 진입은 당분간 무조건 `static`**(완전 정지 측정, MANUAL 로 나올 때까지). AUTO 진입 후 **10초 대기**(물속 영점 확보용)·3초 주행·추력 40 %, 뱅크 선회(bank_left/bank_right)·완전 정지(static) 시나리오, 7장 `ros2 param` 신설,
+최근 개정 2026-10-14: **AUTO 진입 첫 시나리오는 `dive`**, 조종기 콤보로 `straight` 와 번갈아. CSV 64열 `Scenario` 추가, pitch 개루프 스위치(판별 실험용). AUTO 진입 후 **10초 대기**(물속 영점 확보용)·3초 주행·추력 40 %, 뱅크 선회(bank_left/bank_right)·완전 정지(static) 시나리오, 7장 `ros2 param` 신설,
 실험 전 복각 점검 `dip_check.py` 신설 (D.3).
 설계 근거와 측정 이력은 `CLAUDE.md`와 `docs/imu_detailed.md`, 남은 작업은 `docs/todo.md`.
 
@@ -16,9 +16,9 @@
 
 | | **짧게** (0.04~1초, "톡") | **3초** (정확히 3초에 1회 발동) |
 |---|---|---|
-| **btn1** | **AUTO / MANUAL 전환** (AUTO 는 **10초 뒤 시작**. 현재 기본은 `static` — 끝까지 측정, btn1 으로 종료) | **대기압 영점 재포착** — 공기 중 전용, 잠기면 거부 |
+| **btn1** | **AUTO / MANUAL 전환** (AUTO 는 **10초 뒤 시작**. 현재 기본은 `dive` — 3초 주행 후 추력 정지) | **대기압 영점 재포착** — 공기 중 전용, 잠기면 거부 |
 | **btn2** | **현재 방향을 yaw 0°로** (헤딩 영점) | **지자기 보정 시작** (텀블 필요; 한 번 더 3초 = 조기 종료) |
-| **btn1+btn2 동시** | (아무 동작 없음 — 단독 동작만 억제) | **3초 유지 = AUTO 시나리오 전환**. 현재 목록은 `static` 하나라 **눌러도 안 바뀐다** (7.3 에서 되돌리는 법) |
+| **btn1+btn2 동시** | (아무 동작 없음 — 단독 동작만 억제) | **3초 유지 = AUTO 시나리오 전환** — 현재 목록은 **`dive` ↔ `straight`** 둘이다 (2026-10-14) |
 
 - **1초를 넘기고 3초가 안 되면 아무 일도 없다** — 짧지도 길지도 않은 구간은 무시된다.
 - 3초는 `== 300틱` 판정이라 계속 눌러도 한 번만 발동하고, 손을 뗄 때 짧은 누름으로 세지 않는다.
@@ -302,6 +302,8 @@ CSV 49열 `Zero_src` 가 1(정지) / 2(폴백) / 0(없음) 이다.
 | `bank_left` | 롤을 `angle_deg` 만큼 **왼쪽**으로 기울인 채 전진 — 뱅크 선회 (2026-09-16) |
 | `bank_right` | 같은 것을 **오른쪽**으로 |
 | `static` | **완전 정지** — 서보 3개 1500 고정, 추력 0. 구동 없이 센서만 측정. **`run_sec` 무시 — MANUAL 로 나올 때까지 계속** (2026-09-16, 10-01 지속형으로) |
+| `dive_1s` | **핀 스텝** — 1.0초 수평 뒤 `angle_deg` 로 한 번에 꺾는다 (2026-10-16) |
+| `dive_hold` | **잠수→유지** — 1.5초 `angle_deg` 뒤 `hold_deg` 로 바꾼다 (2026-10-16) |
 
 `turn`(헤딩 틀기)은 2026-09-14 요 제어 제거와 함께 없앴다 — 지정하면 모르는 시나리오로 거부된다.
 
@@ -323,6 +325,19 @@ CSV 49열 `Zero_src` 가 1(정지) / 2(폴백) / 0(없음) 이다.
   1 이면 `pid_control_node` 가 PID 를 건너뛰고 `[1500,1500,1500,1000]` 을 낸다. 요 목표가 아니다.
 - 기본 `combo_list` 에는 없다. 버튼으로 돌리려면
   `ros2 param set /auto_scenario_node combo_list "straight,static"` 처럼 넣는다.
+
+**핀 시퀀스 (`dive_1s` · `dive_hold`, 2026-10-16).** 핀 각도를 **계단으로** 주어 응답을 보는
+시나리오다. `pitch_open_loop` 이 켜져 있으면 핀 = `kp_pitch` × 목표 pitch 이므로 목표 pitch 의
+계단이 곧 핀 각도의 계단이 된다 (꺼져 있으면 목표 자세의 계단).
+
+| 시나리오 | 계단 | 개루프에서 핀 (kp 8.75, angle 15) |
+|---|---|---|
+| `dive_1s` | 0~1.0초 피치 0 → 이후 `angle_deg` | M1 1500 → **1631** @1.0초 |
+| `dive_hold` | 0~1.5초 `angle_deg` → 이후 `hold_deg` | M1 1631 → **1543**(hold 5) 또는 **1500**(hold 0) @1.5초 |
+
+- **`run_sec` 을 계단 시각보다 길게 둘 것.** 짧으면 뒷단계가 0.01초로 줄어 사실상 실행되지 않는다.
+- `hold_deg` 는 CSV 열이 없다 — `Target_Pitch`(71열)의 계단 뒤 값이 곧 `hold_deg` 다.
+- 로그 확인: `Scenario`(64열)가 **9**(`dive_1s`) 또는 **10**(`dive_hold`).
 
 **뱅크 선회 (`bank_*`, 2026-09-16).** 요 서보는 그대로 1500 고정이고, 좌우 지느러미로 몸을 기울여 돈다
 (물고기·비행기의 방식). 롤 부호는 벤치 실측으로 확정: **롤 − = 왼쪽, 롤 + = 오른쪽** (좌로 기울여 −34.5°,
@@ -347,13 +362,16 @@ CSV 49열 `Zero_src` 가 1(정지) / 2(폴백) / 0(없음) 이다.
 #### 조종기로 전환 — **btn1+btn2 함께 3초** (2026-09-03 실기 확인)
 
 물가에서 노트북 없이 시나리오를 바꾸는 방법이다. 두 버튼을 **함께 3초** 유지하면
-`combo_list`(**2026-10-01 현재 기본 `static` 하나** — 눌러도 바뀌지 않는다. 종전 기본은
-`straight,dive,bank_left,bank_right` 로 직진·잠수·좌선회·우선회를 돌았다)를 한 칸 돈다.
+`combo_list`(**2026-10-14 현재 기본 `dive,straight`** — 잠수와 직진 둘)를 한 칸 돈다.
 
 ```
-btn1+btn2 함께 3초  →  시나리오 전환 (straight → dive → bank_left → bank_right → 처음).  **모드는 바뀌지 않는다**
-btn1 단독           →  AUTO 진입 — 그때 걸려 있는 시나리오가 실행된다
+btn1 단독           →  AUTO 진입 — 버튼을 안 눌렀으면 dive 가 실행된다 (기본값)
+btn1+btn2 함께 3초  →  straight 로 전환, 다시 누르면 dive 로 복귀.  **모드는 바뀌지 않는다**
 ```
+
+**`scenario` 기본값이 `dive` 라 버튼을 하나도 안 눌러도 AUTO 진입 = 잠수다.** 직진으로 바꾸려면
+콤보를 한 번 누른다(저널에 `시나리오 전환 -> 'straight' (2/2)`). 센서 측정(완전 정지)이나
+뱅크 선회가 필요하면 7.3 참조.
 
 **3초를 채우는 순간 발화한다** — 손을 떼기 전에 이미 바뀐다(실측: 동시 시작 3.0초 뒤 전환).
 3초에 못 미치면 아무 일도 일어나지 않지만, 저널에 몇 초를 눌렀는지 남는다.
@@ -540,19 +558,21 @@ ls -l /proc/*/exe 2>/dev/null | grep '(deleted)'
 
 | 파라미터 | 형식 | 기본값 | 뜻 |
 |---|---|---|---|
-| `scenario` | 문자열 | **static** | straight / dive / climb / porpoise / attitude / bank_left / bank_right / static |
+| `scenario` | 문자열 | **dive** | straight / dive / climb / porpoise / attitude / bank_left / bank_right / static / dive_1s / dive_hold |
+| `hold_deg` | 실수 | 0.0 | `dive_hold` 의 1.5초 이후 목표 피치(도). 다른 시나리오는 안 씀 (2026-10-16) |
 | `start_delay_sec` | 실수 | 10.0 | AUTO 진입 후 대기(초). 0.0 = 즉시 출발. 물속 영점을 잡을 시간이다 |
 | `run_sec` | 실수 | 3.0 | 주행 시간(초). 대기가 끝난 순간부터 센다. **`static` 은 이 값을 무시한다** |
 | `throttle_pct` | 실수 | 40.0 | 추력 % (0~100). attitude 는 무시하고 0 |
 | `angle_deg` | 실수 | 15.0 | dive/climb 의 목표 피치(도). 나머지 시나리오는 안 씀 |
-| `combo_list` | 문자열 | **static** | btn1+btn2 3초가 돌아가며 고르는 목록. 하나뿐이라 지금은 전환이 없다 |
+| `combo_list` | 문자열 | **dive,straight** | btn1+btn2 3초가 돌아가며 고르는 목록 (2026-10-14) |
 
-> **2026-10-01: 기본값이 `static` 하나로 묶여 있다.** 운용자 요청으로 AUTO 진입이 무조건 완전 정지
-> 측정이 되게 해 둔 상태이고, **시나리오 코드는 전부 그대로 남아 있다.** 주행 시험으로 돌아가려면
-> 두 줄이면 된다(재시작하면 기본값으로 되돌아간다 — 영구히 바꾸려면 소스 기본값 수정):
+> **2026-10-14 기본값**: `scenario` = `dive`, `combo_list` = `dive,straight`.
+> 버튼을 안 눌러도 AUTO 진입이 잠수이고, 콤보로 직진과 번갈아 바꾼다. **시나리오 코드는
+> 전부 남아 있다** — 센서 측정이나 뱅크 선회가 필요하면 파라미터로 넣는다(재시작하면 기본값으로
+> 되돌아간다. 영구히 바꾸려면 소스 기본값 수정):
 > ```bash
-> ros2 param set /auto_scenario_node scenario straight
-> ros2 param set /auto_scenario_node combo_list "straight,dive,bank_left,bank_right"
+> ros2 param set /auto_scenario_node scenario static                 # 완전 정지 측정
+> ros2 param set /auto_scenario_node combo_list "dive,straight,bank_left,bank_right"
 > ```
 
 **`hydro_estimator_node`** — `wet_zero_*` 만 실행 중 바뀌고, 다음 AUTO 진입(대기 시작)부터 적용된다.
