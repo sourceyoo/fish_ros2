@@ -11,7 +11,8 @@
 //          /rc/status             (Int32MultiArray[5])   버튼 (btn1 롱프레스 = 대기압 재영점)
 //          /sensor/tail_rpm       (Int32)                포트 배정 뒤바뀜 감시용
 //          /raw/imu_6dof          (Imu)                  자이로 크기[도/초] — 대기창 정지 판정용
-//          /auto/state            (Int32)                0 IDLE/1 WAIT/2 RUN — 대기창 영점의 수집·확정 시점
+//          /auto/state            (Int32)                100*시나리오ID + 상태. **상태만 쓴다(% 100)**:
+//                                                        0 IDLE/1 WAIT/2 RUN — 대기창 영점의 수집·확정 시점
 //   [출력] /filtered/hydro             (Float32MultiArray[15]) 아래 배열 규격 참조
 //          /sensor/pressure_calibrated (Float32MultiArray[3]) 대기압 영점 제거된 게이지압[mbar]
 //   [서비스] /hydro/zero_atm (std_srvs/Trigger)  대기압 영점 재포착 (공기 중)
@@ -841,7 +842,10 @@ private:
 
     void auto_state_callback(const std_msgs::msg::Int32::SharedPtr msg) {
         last_auto_state_time_ = this->now();
-        set_auto_state(msg->data);
+        // **% 100 이 필수다** (2026-10-14): /auto/state 는 100*시나리오ID + 상태 다.
+        // 이걸 빼면 state 가 802(static·RUN) 같은 값이 되어 WAIT 도 RUN 도 아닌 것으로
+        // 보이고, 대기창 영점이 영원히 수집되지 않는다(전이를 못 본다).
+        set_auto_state(msg->data % 100);
     }
 
     // 전이만 본다. WAIT 로 들어가면 수집 시작, WAIT 에서 RUN 으로 나가면 확정,

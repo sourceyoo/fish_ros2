@@ -6,9 +6,30 @@
 //   [입력] /filtered/attitude (Vector3)  <- 자세 + 모드 플래그(±5000 오프셋)
 //   [출력] /auto/command     (Quaternion) -> pid_control_node의 목표값
 //                                         z = 서보 고정 플래그 (0 평상시 / 1 = 완전 정지, 2026-09-16)
-//          /auto/state       (Int32)      -> 0 IDLE / 1 WAIT(진입 대기) / 2 RUN(주행), 매 틱(100 Hz)
-//                                           hydro_estimator_node 가 대기창 물속 영점을 모으고 확정하는
-//                                           시점으로, data_logger_node 가 CSV State 열로 쓴다 (2026-09-16)
+//          /auto/run_info    (Float32MultiArray[4]) -> [회차, 추력%, 각도도, 주행초] — 진입 때 잠근 값
+//                                           (2026-10-15). data_logger_node 가 CSV 65~68열로 쓴다.
+//                                           회차는 **AUTO 진입마다 1 증가**하는 번호다(노드 기동 시 0).
+//                                           사후 분석에서 "몇 번째 주행의 설정이 무엇이었나"를
+//                                           로그 한 줄에서 바로 읽기 위한 것 — 지금까지는 저널을
+//                                           뒤져야 했다. 매 틱 발행하므로 MANUAL 구간에는 **직전
+//                                           주행의 값**이 남는다(아직 한 번도 안 달렸으면 회차 0).
+//          /auto/state       (Int32)      -> **100*시나리오ID + 상태** 로 둘을 한 숫자에 싣는다 (2026-10-14)
+//                                           상태  = 값 % 100 : 0 IDLE / 1 WAIT(진입 대기) / 2 RUN(주행)
+//                                           시나리오ID = 값 / 100 : 아래 SCENARIO_ID 표
+//                                           hydro_estimator_node 는 상태만 보고(대기창 영점 시점),
+//                                           data_logger_node 는 둘로 나눠 CSV State·Scenario 열로 쓴다.
+//
+//  ── 왜 한 숫자에 싣나 (2026-10-14) ────────────────────────────────────────
+//  "로그만 보고 무엇이 돌았는지 알 수 없다"는 문제가 실제로 걸렸다 — 10-03 로그는
+//  주행 10회가 분명한데 straight 인지 dive 인지 bank 인지 CSV 로는 못 가렸고 저널을
+//  뒤져야 했다. 그래서 시나리오를 CSV 에 남긴다.
+//  문자열 토픽을 새로 만들지 않고 기존 /auto/state 에 끼운 이유:
+//    · CSV 가 숫자 열이라 awk/python 으로 거르기 쉽다 (문자열은 쉼표·따옴표 문제가 붙는다)
+//    · 상태와 시나리오는 **같은 순간의 한 사실**이다. 토픽이 둘이면 전이 틱에서 서로
+//      어긋난 조합(예: RUN 인데 직전 시나리오)이 로그에 남을 수 있다
+//    · 구독자(hydro)가 `% 100` 한 줄만 더하면 되고 기존 판정이 그대로 간다
+//  ※ 새 ID 를 추가하면 **세 파일을 같이 고쳐야 한다** — 여기, data_logger_node 의
+//    해독표, 그리고 docs/csv_format.md 의 표. ±5000 모드 규약과 같은 종류의 약속이다.
 //
 //  ── 시나리오 교체 방식 (2026-09-03) ────────────────────────────────────────
 //  시나리오는 **단계표(Step 배열)** 하나로 표현한다. 단계마다 지속시간과
@@ -18,12 +39,14 @@
 //  ── 조종기로 전환 (2026-09-03) ────────────────────────────────────────────
 //  **btn1+btn2 동시 누름** = 시나리오 전환. state_estimation_ekf_node 가 조합을
 //  감지해 `/ui/scenario_next` 를 발행하고, 이 노드가 `combo_list` 를 한 칸 돌린다.
-//  **2026-10-03 현재 기본값은 scenario=straight, combo_list="straight,dive,bank_left,bank_right"**
-//  (운용자 요청) — AUTO 진입은 직진으로 시작하고, 조합 버튼마다 직진 -> 다이브 -> 좌선회 ->
-//  우선회 순으로 한 칸씩 돈다. 2026-10-01 에 센서 측정용으로 static 에 고정해 두었던 것을
-//  되돌린 것이다. 센서만 측정할 때는 파라미터로 다시 static 에 묶으면 된다:
+//  **2026-10-14 현재 기본값은 scenario=dive, combo_list="dive,straight"** (운용자 요청) —
+//  버튼을 하나도 안 눌러도 **AUTO 진입 첫 시나리오가 dive(잠수)** 이고, 조합 버튼으로
+//  직진과 번갈아 바꾼다. 뱅크 선회는 코드에 남아 있지만 버튼 목록에서는 뺐다.
+//  이 기본값 두 줄은 측정과 주행 사이를 여러 번 오갔다 — 10-01 static 고정, 10-03 주행 복귀,
+//  10-05 재고정, 10-14 dive + 콤보 둘로. **시나리오 코드는 매번 그대로 뒀다.**
+//  센서 측정이나 다른 조합이 필요하면 파라미터로 넣는다:
 //     ros2 param set /auto_scenario_node scenario static
-//     ros2 param set /auto_scenario_node combo_list "static"
+//     ros2 param set /auto_scenario_node combo_list "dive,straight,bank_left,bank_right"
 //
 //  ※ 조합은 **모드를 바꾸지 않는다.** 시나리오만 갈아 끼우고, 실제 주행은 btn1 단독
 //     누름으로 AUTO 에 들어갈 때 시작된다. 전환은 저널에 크게 남는다 — 지금 무엇이
@@ -107,6 +130,7 @@
 #include <geometry_msgs/msg/quaternion.hpp>
 #include <std_msgs/msg/empty.hpp>
 #include <std_msgs/msg/int32.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>
 #include <sstream>
 #include <vector>
 #include <string>
@@ -115,6 +139,28 @@
 // /auto/state 값. hydro_estimator_node·data_logger_node 가 같은 숫자로 해독한다 —
 // 바꾸면 세 파일을 같이 바꿔야 한다 (±5000 모드 규약과 같은 종류의 약속).
 enum { AUTO_STATE_IDLE = 0, AUTO_STATE_WAIT = 1, AUTO_STATE_RUN = 2 };
+
+// 시나리오 ID — /auto/state 에 100 배수로 실린다. **번호를 재배정하지 말 것**:
+// 지난 로그의 Scenario 열이 이 숫자로 해석되므로, 새 시나리오는 뒤에 붙인다.
+// 0 은 "모름"(MANUAL 이거나 이름을 못 읽은 경우)이다.
+enum {
+    SCEN_NONE = 0, SCEN_STRAIGHT = 1, SCEN_DIVE = 2, SCEN_CLIMB = 3,
+    SCEN_PORPOISE = 4, SCEN_ATTITUDE = 5, SCEN_BANK_LEFT = 6,
+    SCEN_BANK_RIGHT = 7, SCEN_STATIC = 8
+};
+
+// 이름 -> ID. is_known_scenario() 와 **같은 목록이어야 한다**(모르는 이름은 0).
+static int scenario_id_of(const std::string &s) {
+    if (s == "straight")   return SCEN_STRAIGHT;
+    if (s == "dive")       return SCEN_DIVE;
+    if (s == "climb")      return SCEN_CLIMB;
+    if (s == "porpoise")   return SCEN_PORPOISE;
+    if (s == "attitude")   return SCEN_ATTITUDE;
+    if (s == "bank_left")  return SCEN_BANK_LEFT;
+    if (s == "bank_right") return SCEN_BANK_RIGHT;
+    if (s == "static")     return SCEN_STATIC;
+    return SCEN_NONE;
+}
 
 class AutoScenarioNode : public rclcpp::Node {
 public:
@@ -138,12 +184,14 @@ public:
                          run_done_logged_(false)
     {
         // ── 파라미터 (기본값의 진실원은 여기 한 곳) ────────────────────────
-        // 2026-10-05: 운용자 요청으로 **AUTO 진입 기본값을 다시 static**(센서 측정)으로 되돌렸다.
-        // 10-01 고정 -> 10-03 주행 복귀 -> 10-05 재고정. 시나리오 코드는 매번 그대로 두고
-        // 이 기본값 한 줄만 오간다. 주행으로 돌아갈 때:
-        //   ros2 param set /auto_scenario_node scenario straight
-        // ※ combo_list 는 주행 목록(직진·잠수·좌·우) 그대로다 — 조합 버튼을 누르면 주행이 걸린다.
-        scenario_     = this->declare_parameter<std::string>("scenario", "static");
+        // 2026-10-14: 운용자 요청으로 **AUTO 진입 첫 시나리오를 dive** 로 둔다. 버튼을 하나도
+        // 안 눌러도 btn1 진입만으로 잠수가 돈다.
+        // 이 기본값 한 줄은 측정과 주행 사이를 여러 번 오갔다 — 10-01 static, 10-03 straight,
+        // 10-05 static, 10-14 dive. **시나리오 코드는 매번 그대로 뒀다.**
+        // 센서 측정(완전 정지)으로 돌아갈 때:
+        //   ros2 param set /auto_scenario_node scenario static
+        // ※ combo_list 는 "dive,straight" 다 (10-14) — 조합 버튼으로 직진과 오간다.
+        scenario_     = this->declare_parameter<std::string>("scenario", "dive");
         run_sec_      = this->declare_parameter<double>("run_sec", 3.0);
         throttle_pct_ = this->declare_parameter<double>("throttle_pct", 40.0);
         angle_deg_    = this->declare_parameter<double>("angle_deg", 15.0);
@@ -152,9 +200,12 @@ public:
             RCLCPP_WARN(this->get_logger(), "[AUTO] start_delay_sec %.1f 는 음수라 0 으로 둡니다", start_delay_sec_);
             start_delay_sec_ = 0.0;
         }
-        // btn1+btn2 3초마다 직진 -> 잠수 -> 좌선회 -> 우선회 -> 직진 순으로 한 칸 돈다.
-        // 센서 측정만 할 때는 "static" 하나만 넣으면 전환할 곳이 없어 계속 static 이다.
-        combo_list_   = parse_list(this->declare_parameter<std::string>("combo_list", "straight,dive,bank_left,bank_right"));
+        // btn1+btn2 3초마다 **잠수 <-> 직진** 으로 한 칸 돈다 (2026-10-14, 운용자 요청).
+        // 물가에서 노트북 없이 바꿀 수 있게 둘만 남겼다 — 뱅크 선회는 목록에서 뺐다.
+        // ※ scenario 기본값이 dive 라 **버튼을 안 눌러도 AUTO 진입 = dive** 다. 콤보는
+        //   straight 로 옮기고 다시 누르면 dive 로 돌아온다 (목록이 둘뿐이라 번갈아).
+        // 뱅크까지 쓰려면: ros2 param set /auto_scenario_node combo_list "dive,straight,bank_left,bank_right"
+        combo_list_   = parse_list(this->declare_parameter<std::string>("combo_list", "dive,straight"));
 
         param_cb_ = this->add_on_set_parameters_callback(
             [this](const std::vector<rclcpp::Parameter> &ps) {
@@ -214,6 +265,9 @@ public:
         // 대기/주행 상태. /auto/command 의 추력만 봐서는 "대기"와 "추력 0 시나리오(attitude)"를
         // 구별할 수 없어 따로 낸다. 매 틱 발행 — 구독자가 이 노드의 사망을 끊김으로 알아챈다.
         auto_state_pub_ = this->create_publisher<std_msgs::msg::Int32>("/auto/state", 10);
+
+        // 진입 때 잠근 설정 + 회차. 숫자가 네 개뿐이라 커스텀 메시지를 만들지 않는 관례를 따른다.
+        run_info_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/auto/run_info", 10);
 
         // btn1+btn2 동시 (EKF 가 조합을 판정해 보내준다) -> 시나리오 한 칸 전환
         scenario_next_sub_ = this->create_subscription<std_msgs::msg::Empty>(
@@ -322,6 +376,7 @@ private:
             active_thr_pct_   = throttle_pct_;
             active_delay_sec_ = start_delay_sec_;
             active_steps_     = build_steps();
+            run_id_++;   // 회차. 진입마다 1 증가하고 노드가 사는 동안 유지된다
             // 지속 시나리오인가 — 첫 단계의 open_ended 로 판정한다(지속 시나리오는 한 줄짜리다)
             active_open_ended_ = !active_steps_.empty() && active_steps_.front().open_ended;
 
@@ -444,9 +499,21 @@ private:
         prev_auto_mode_ = is_auto_mode_;
         auto_cmd_pub_->publish(cmd_msg);
 
+        // 상태와 시나리오를 한 숫자로. MANUAL·주행종료(IDLE)에서는 **진입 때 잠근 값이
+        // 아니라 지금 걸려 있는 설정**을 싣는다 — 다음에 btn1 을 누르면 무엇이 도는지를
+        // 로그에서 미리 볼 수 있어야 하기 때문이다. WAIT/RUN 중에는 잠긴 값이 나간다.
+        const int scen_id = (state == AUTO_STATE_IDLE) ? scenario_id_of(scenario_)
+                                                       : scenario_id_of(active_scenario_);
         std_msgs::msg::Int32 st;
-        st.data = state;
+        st.data = 100 * scen_id + state;
         auto_state_pub_->publish(st);
+
+        // 잠긴 설정 + 회차. **진입 때 잠근 값을 그대로 낸다** — 지금 파라미터가 아니라
+        // "이번 주행이 무엇으로 돌았나"가 로그에 남아야 한다(설정은 주행 중에도 바뀔 수 있다).
+        // 각도는 angle_deg_ 를 잠그지 않으므로(단계표에 이미 녹아 있다) 현재 값을 낸다.
+        std_msgs::msg::Float32MultiArray ri;
+        ri.data = { (float)run_id_, (float)active_thr_pct_, (float)angle_deg_, (float)active_run_sec_ };
+        run_info_pub_->publish(ri);
     }
 
     bool is_auto_mode_;
@@ -469,7 +536,9 @@ private:
     rclcpp::Time auto_entry_time_;   // AUTO 진입 시각 — 대기와 주행 시간 모두 여기서 센다
 
     rclcpp::Publisher<geometry_msgs::msg::Quaternion>::SharedPtr auto_cmd_pub_;
+    int32_t run_id_ = 0;   // AUTO 진입 회차 (노드 기동 시 0, 진입마다 +1)
     rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr           auto_state_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr run_info_pub_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3>::SharedPtr attitude_sub_;
     rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr scenario_next_sub_;
     rclcpp::TimerBase::SharedPtr loop_timer_;

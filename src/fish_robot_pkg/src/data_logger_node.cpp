@@ -14,8 +14,11 @@
 //          /raw/magnetometer           (Vector3)              원시 지자기[µT], 보정 전 칩 축
 //          /filtered/ekf_status        (Float32MultiArray[12]) [0..2] 자이로 바이어스, [10] 플래그
 //          /filtered/hydro             (Float32MultiArray[15]) 수심[m]·속도[m/s]·동압·자세보정 + 대기창 영점
-//          /auto/state                 (Int32)                0 IDLE / 1 WAIT / 2 RUN (auto_scenario_node)
+//          /auto/state                 (Int32)                100*시나리오ID + 상태 (auto_scenario_node).
+//                                                                 둘로 나눠 State·Scenario 열에 적는다
 //          /raw/imu_mpu9250            (Float32MultiArray[7]) MPU9250 6축[g, 도/초, nRF IMU 칩 축으로 회전됨] + 칩 온도[°C] — 감시용 2번째 IMU
+//          /auto/run_info              (Float32MultiArray[4]) [회차, 추력%, 각도, 주행초] — 진입 때 잠근 값
+//          /pid/debug                  (Float32MultiArray[4]) [kp_pitch, 개루프, 목표pitch, 목표roll]
 //   [출력] ~/ros2_ws/log_csv/fish_log_YYYYMMDD_HHMMSS.csv
 //
 //  ── 절대 시각 (2026-10-07) ─────────────────────────────────────────────────
@@ -41,7 +44,7 @@
 //  원시값 3종을 상시 기록하는 이유(2026-08-18): 물속 운용은 재현이 안 된다.
 //  융합 결과만 남으면 자세 이상이 "센서 탓인지 필터 탓인지" 사후 규명이 불가능하다.
 //
-//  ※ 크기: 100Hz x 63컬럼 ≈ 시간당 131MB (62컬럼 125MB, 55컬럼 110MB, 47컬럼 99MB). 파일당 200MB(약 2.0시간)에서 새 파일로
+//  ※ 크기: 100Hz x 73컬럼 ≈ 시간당 150MB (63컬럼 131MB, 55컬럼 110MB, 47컬럼 99MB). 파일당 200MB(약 2.0시간)에서 새 파일로
 //     회전하며, Time(s) 축은 회전을 넘어 이어진다(기동 시각 기준 유지). 오래된
 //     파일은 지우지 않는다 — log_csv/에는 실험 CSV와 지자기 보정 파일이 같이
 //     살므로 자동 삭제는 위험하다. 총량 관리는 사람 몫.
@@ -100,6 +103,7 @@ public:
             p0_raw_ = nan_f; p1_raw_ = nan_f; p2_raw_ = nan_f;
         }
         rssi_ = 0;
+        vbat1_ = 0;   // 센티볼트. 조종기 미수신 구간에는 0 이 찍힌다
         ax_ = 0.0f; ay_ = 0.0f; az_ = 0.0f;             // 원시 가속도 [g]
         gx_ = 0.0f; gy_ = 0.0f; gz_ = 0.0f;             // 원시 자이로 [도/초]
         mx_ = 0.0f; my_ = 0.0f; mz_ = 0.0f;             // 원시 지자기 [µT]
@@ -114,7 +118,13 @@ public:
             q_zero_ = nf; zero_t0_ = nf; zero_t1_ = nf; q_dyn_wz_ = nf; speed_wz_ = nf;
         }
         hydro_seq_ = 0; hydro_flags_ = 0;
-        zero_src_ = 0; still_ = 0; auto_state_ = 0;
+        zero_src_ = 0; still_ = 0; auto_state_ = 0; scenario_id_ = 0;
+        // 65~72열도 NaN/0 으로 시작한다 — 아직 발행자가 안 붙은 구간을 구별하기 위해
+        {
+            const float nf = std::numeric_limits<float>::quiet_NaN();
+            run_id_ = 0; thr_pct_ = nf; angle_deg_ = nf; run_sec_ = nf;
+            kp_pitch_ = nf; pitch_ol_ = 0; target_pitch_ = nf; target_roll_ = nf;
+        }
         // 2번째 IMU 도 NaN 으로 시작 — 미수신과 0 을 구별
         for (int i = 0; i < 7; i++) mpu_[i] = std::numeric_limits<float>::quiet_NaN();
 
@@ -159,11 +169,40 @@ public:
         hydro_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
             "/filtered/hydro", 10, std::bind(&DataLoggerNode::hydro_callback, this, std::placeholders::_1));
 
+        // 회차와 진입 때 잠근 설정 (auto_scenario_node, 100 Hz) — CSV 65~68열.
+        run_info_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
+            "/auto/run_info", 10,
+            [this](const std_msgs::msg::Float32MultiArray::SharedPtr m) {
+                if (m->data.size() < 4) return;
+                run_id_    = static_cast<int32_t>(m->data[0]);
+                thr_pct_   = m->data[1];
+                angle_deg_ = m->data[2];
+                run_sec_   = m->data[3];
+            });
+
+        // PID 진단 (pid_control_node, 100 Hz) — CSV 69~72열. 게인·개루프 스위치는 실행 중
+        // 바뀌므로 "그 순간 무엇으로 제어했나"가 같은 행에 남아야 사후 대조가 된다.
+        pid_debug_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
+            "/pid/debug", 10,
+            [this](const std_msgs::msg::Float32MultiArray::SharedPtr m) {
+                if (m->data.size() < 4) return;
+                kp_pitch_     = m->data[0];
+                pitch_ol_     = static_cast<int32_t>(m->data[1]);
+                target_pitch_ = m->data[2];
+                target_roll_  = m->data[3];
+            });
+
         // AUTO 대기/주행 상태 (auto_scenario_node, 100 Hz). hydro 배열로 받으면 11 Hz 라
         // 전이 시각이 90 ms 뭉개지므로 직접 받는다. 0 IDLE / 1 WAIT / 2 RUN.
+        // /auto/state 는 100*시나리오ID + 상태 다 (2026-10-14). 두 열로 나눠 적는다.
+        // 로그만 보고 "무엇이 돌았는지"를 가릴 수 있어야 한다 — 10-03 로그에서 주행
+        // 10회가 분명한데 어느 시나리오였는지 CSV 로 못 가려 저널을 뒤져야 했다.
         auto_state_sub_ = this->create_subscription<std_msgs::msg::Int32>(
             "/auto/state", 10,
-            [this](const std_msgs::msg::Int32::SharedPtr msg) { auto_state_ = msg->data; });
+            [this](const std_msgs::msg::Int32::SharedPtr msg) {
+                auto_state_  = msg->data % 100;
+                scenario_id_ = msg->data / 100;
+            });
 
         // 2번째 IMU (MPU9250, i2c_driver_node, 100 Hz) — 감시용. 자이로 바이어스가 튀는
         // 순간을 nRF IMU 와의 차이로 사후에 짚기 위한 것. i2c_driver_node 가 nRF IMU 칩 축으로
@@ -239,6 +278,19 @@ private:
         //   Q_zero: 적용 중인 영점[mbar] (확정 전 nan, 없음이면 0) / Zero_src: 0 없음·1 정지 구간·2 폴백
         //   Zero_t0·t1: 영점 구간 시각 (Time(s) 축) / Still: WAIT 중 정지 판정 0/1
         //   Q_dyn_wz = Q_raw − P_hydro − Q_zero (필터 없음) / Speed_wz / State: 0 IDLE·1 WAIT·2 RUN
+        // 65~73열: 회차·잠긴 설정·PID 상태·배터리 (2026-10-15). 로그 한 줄만 보고 "몇 번째
+        //   주행이 어떤 설정·게인으로 돌았나"를 알 수 있게 한 것 — 지금까지는 저널을 뒤져야 했다.
+        //   Run_id 는 AUTO 진입마다 +1 (노드 기동 시 0). Throttle_pct/Run_sec 는 **진입 때 잠근**
+        //   값이고 Angle_deg 는 현재 파라미터다(단계표에 이미 녹아 있어 따로 잠그지 않는다).
+        //   Kp_pitch/Pitch_OL 은 ros2 param 으로 주행 중에도 바뀌므로 매 행 기록한다.
+        //   Target_Pitch/Target_Roll 은 AUTO 면 시나리오 목표, MANUAL 이면 스틱 목표다.
+        //   VBat 은 23열 RSSI 와 같은 /rc/status 에서 오고, 센티볼트를 V 로 환산해 둔 것이다.
+        //   ※ 페일세이프·static 구간에서는 /pid/debug 가 발행되지 않아 69~72열에 직전 값이 남는다.
+        // 64열: Scenario — AUTO 에 걸린 시나리오 ID (2026-10-14). 0 모름/MANUAL · 1 straight ·
+        //   2 dive · 3 climb · 4 porpoise · 5 attitude · 6 bank_left · 7 bank_right · 8 static.
+        //   **번호는 auto_scenario_node 의 SCEN_* enum 과 짝이다** — 재배정하면 지난 로그가 깨진다.
+        //   MANUAL(AutoMode=0)·주행종료 구간에는 "다음에 돌 시나리오"가 들어간다. 실제로 돈
+        //   구간을 보려면 State(55열)=2 로 먼저 거를 것.
         // 63열: Epoch(s) — UTC 유닉스 시각[초, ms 정밀도]. 로봇 밖 기록과 같은 시간선에 올리는 열.
         //   맨 뒤에 붙여 기존 열 번호를 하나도 건드리지 않았다 (머리말 "절대 시각" 참조).
         // 56~62열: MPU9250 6축 + 온도 (2026-09-16, 감시용 2번째 IMU). 단위는 24~29열과 같은 g·도/초,
@@ -248,7 +300,8 @@ private:
                      "P0_raw,P1_raw,P2_raw,"
                      "Depth,Speed,Q_dyn,Q_raw,P_hydro,Hydro_Pitch,Hydro_Seq,Hydro_Flags,"
                      "Q_zero,Zero_src,Zero_t0,Zero_t1,Still,Q_dyn_wz,Speed_wz,State,"
-                     "MPU_AX,MPU_AY,MPU_AZ,MPU_GX,MPU_GY,MPU_GZ,MPU_T,Epoch(s)\n");
+                     "MPU_AX,MPU_AY,MPU_AZ,MPU_GX,MPU_GY,MPU_GZ,MPU_T,Epoch(s),Scenario,"
+                     "Run_id,Throttle_pct,Angle_deg,Run_sec,Kp_pitch,Pitch_OL,Target_Pitch,Target_Roll,VBat\n");
         fflush(fp_);   // 헤더는 즉시 기록해 파일이 비어 보이지 않게 한다
 
         return 0;
@@ -320,6 +373,9 @@ private:
         if (msg->data.size() < 5) return;
         int current_btn1 = msg->data[0];
         rssi_ = msg->data[4];
+        // 배터리 전압 — 지금까지 받고도 버리던 값이다(73열 VBat, 2026-10-15).
+        // **센티볼트다** — 100 으로 나눠야 V 다 (CLAUDE.md §3). 기록 시점에 나눈다.
+        vbat1_ = msg->data[2];
 
         // 짧은 누름(Edge Detection)으로 버튼 누적 카운트만 집계한다.
         // 자동/수동 모드 판정은 여기서 하지 않고 state_estimation이 방송한
@@ -474,7 +530,8 @@ private:
                      "%.4f,%.3f,%.4f,%.4f,%.4f,%.2f,%d,%d,"
                      "%.4f,%d,%.2f,%.2f,%d,%.4f,%.3f,%d,"
                      "%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.1f,"
-                     "%.3f\n",
+                     "%.3f,%d,"
+                     "%d,%.1f,%.1f,%.2f,%.3f,%d,%.2f,%.2f,%.2f\n",
                 relative_time_sec,
                 btn1_cumulative_count_,
                 mode_,
@@ -495,7 +552,9 @@ private:
                 depth_, speed_, q_dyn_, q_raw_, p_hydro_, hydro_pitch_, hydro_seq_, hydro_flags_,
                 q_zero_, zero_src_, zero_t0_, zero_t1_, still_, q_dyn_wz_, speed_wz_, auto_state_,
                 mpu_[0], mpu_[1], mpu_[2], mpu_[3], mpu_[4], mpu_[5], mpu_[6],
-                epoch_sec);
+                epoch_sec, scenario_id_,
+                run_id_, thr_pct_, angle_deg_, run_sec_,
+                kp_pitch_, pitch_ol_, target_pitch_, target_roll_, vbat1_ / 100.0f);
 
         // 50줄(0.5초)마다 디스크로 강제 플러시.
         // 매 줄 플러시하면 SD카드 I/O로 100Hz 루프가 밀리고, 아예 안 하면
@@ -552,8 +611,15 @@ private:
     int32_t hydro_seq_, hydro_flags_;
     float q_zero_, zero_t0_, zero_t1_, q_dyn_wz_, speed_wz_;      // 대기창 영점. 미확정 = NaN
     int32_t zero_src_, still_, auto_state_;                       // 0 없음/1 정지/2 폴백, 0/1, 0 IDLE/1 WAIT/2 RUN
+    int32_t scenario_id_;                                         // 시나리오 ID (auto_scenario_node SCEN_* 와 짝)
+    int32_t run_id_;                                              // AUTO 진입 회차 (65열)
+    float   thr_pct_, angle_deg_, run_sec_;                       // 진입 때 잠근 설정 (66~68열)
+    float   kp_pitch_;                                            // 그 순간 pitch 게인 (69열)
+    int32_t pitch_ol_;                                            // pitch 개루프 0/1 (70열)
+    float   target_pitch_, target_roll_;                          // 그 순간 목표 각도 [도] (71~72열)
     float mpu_[7];                                                // MPU9250 [ax ay az g, gx gy gz 도/초, 온도 °C]. 미수신 = NaN
     int32_t rssi_;
+    int32_t vbat1_;                                               // 배터리 전압 [센티볼트] (73열, ÷100 해서 기록)
     float ax_, ay_, az_, gx_, gy_, gz_;      // 원시 6축 [g, 도/초]
     float mx_, my_, mz_;                     // 원시 지자기 [µT], 보정 전 칩 축
     float bias_x_, bias_y_, bias_z_;         // EKF 자이로 바이어스 추정 [도/초]
@@ -574,6 +640,8 @@ private:
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr ekf_status_sub_;
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr hydro_sub_;
     rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr auto_state_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr run_info_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr pid_debug_sub_;
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr mpu_sub_;
 };
 
