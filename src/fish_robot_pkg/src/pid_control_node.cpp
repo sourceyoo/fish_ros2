@@ -9,6 +9,13 @@
 //                                            z = 서보 고정 플래그 (2026-09-16, 아래 참조)
 //          /sensor/tail_rpm    (Int32)      <- 꼬리 RPM (현재는 수집만)
 //   [출력] /motor/output       (UInt16MultiArray[4]) -> uart_bridge_node
+//          /pid/debug          (Float32MultiArray[4]) -> [kp_pitch, pitch_open_loop, 목표pitch, 목표roll]
+//                                 (2026-10-15) data_logger_node 가 CSV 69~72열로 쓴다. **진단 전용** —
+//                                 제어 경로는 이 토픽을 읽지 않는다. 게인과 개루프 스위치는 실행 중
+//                                 바뀌므로(ros2 param set, 즉시 반영) "그 순간 무엇으로 제어했나"가
+//                                 로그에 함께 남아야 사후 대조가 된다. 목표값도 같이 싣는 이유는
+//                                 AUTO 시나리오 목표(/auto/command)와 수동 스틱 목표가 같은 열에
+//                                 모여야 모드와 무관하게 "지시한 각도"를 한 열에서 읽을 수 있기 때문이다.
 //
 //  실행 시점 : 타이머가 아니라 /filtered/attitude 수신 콜백에서 PID를 돌린다.
 //              즉 제어 주기 = 자세 발행 주기 = IMU 100Hz에 자동으로 동기화된다.
@@ -36,6 +43,7 @@
 #include <std_msgs/msg/int32.hpp>
 #include <std_msgs/msg/int32_multi_array.hpp>
 #include <std_msgs/msg/u_int16_multi_array.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>
 
 #include <stdio.h>
 #include <stdint.h>
@@ -81,6 +89,7 @@ public:
                        // 축 부호. 피치는 IMU 규약이 항공과 반대(양수 pitch = 기수 아래)라
                        // 뒤집힐 소지가 상시 있다 — 벤치에서 지느러미를 보고 확정할 것.
                        invert_pitch_(false), invert_roll_(false),
+                       pitch_open_loop_(false),
                        // 조종기 짐벌 배선 스왑을 파이에서 우회하던 스위치. 조종기 펌웨어를
                        // 고쳤으므로(2026-09-04) 기본값은 false 다 — 켜 두면 두 번 뒤집혀 원위치.
                        swap_rc_rp_(false),
@@ -118,6 +127,9 @@ public:
         // 축 부호 — 서보 반전과 목적이 다르다. 믹싱 주석의 1)/2) 구분을 볼 것.
         invert_pitch_ = this->declare_parameter<bool>("invert_pitch", invert_pitch_);
         invert_roll_  = this->declare_parameter<bool>("invert_roll",  invert_roll_);
+        // pitch 개루프 스위치 (2026-10-14, 판별 실험용). true + AUTO 이면 pitch 핀을 측정 pitch 없이
+        // kp_pitch × 목표 pitch 로만 낸다. roll 은 그대로 피드백. 기본 false = 기존 동작과 동일.
+        pitch_open_loop_ = this->declare_parameter<bool>("pitch_open_loop", pitch_open_loop_);
         swap_rc_rp_   = this->declare_parameter<bool>("swap_rc_roll_pitch", swap_rc_rp_);
         rc_inv_roll_  = this->declare_parameter<bool>("invert_rc_roll",  rc_inv_roll_);
         rc_inv_pitch_ = this->declare_parameter<bool>("invert_rc_pitch", rc_inv_pitch_);
@@ -146,9 +158,14 @@ public:
             "=== [PID Control] 수동 스틱 부호 반전: 롤 %d / 피치 %d  (AUTO 는 규약이 달라 제외) ===",
             rc_inv_roll_, rc_inv_pitch_);
         RCLCPP_INFO(this->get_logger(),
+            "=== [PID Control] pitch 개루프 스위치: %d (기본 0 = 피드백) ===", pitch_open_loop_);
+        RCLCPP_INFO(this->get_logger(),
             "=== [PID Control] 런타임 튜닝: ros2 param set /pid_control_node kp_pitch <값> ===");
 
         motor_pub_ = this->create_publisher<std_msgs::msg::UInt16MultiArray>("/motor/output", 10);
+
+        // 진단 전용. 숫자 네 개라 커스텀 메시지를 만들지 않는 관례를 따른다.
+        debug_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/pid/debug", 10);
 
         // 이 구독이 제어 루프의 심장이다 (콜백 안에서 PID 연산 + 발행까지 수행)
         attitude_sub_ = this->create_subscription<geometry_msgs::msg::Vector3>(
@@ -251,6 +268,12 @@ private:
             if (n == "swap_rc_roll_pitch")  { swap_rc_rp_   = prm.as_bool(); RCLCPP_WARN(this->get_logger(), "[PID Control] 수동 스틱 롤<->피치 스왑 = %d", swap_rc_rp_); continue; }
             if (n == "invert_rc_roll")      { rc_inv_roll_  = prm.as_bool(); RCLCPP_WARN(this->get_logger(), "[PID Control] 수동 스틱 부호: 롤 반전 = %d",  rc_inv_roll_);  continue; }
             if (n == "invert_rc_pitch")     { rc_inv_pitch_ = prm.as_bool(); RCLCPP_WARN(this->get_logger(), "[PID Control] 수동 스틱 부호: 피치 반전 = %d", rc_inv_pitch_); continue; }
+            if (n == "pitch_open_loop") {
+                pitch_open_loop_ = prm.as_bool();
+                err_sum_pitch_ = 0.0f; prev_err_pitch_ = 0.0f;   // 켜고 끌 때 적분·미분 상태 비움 (복귀 시 튐 방지)
+                RCLCPP_WARN(this->get_logger(), "[PID Control] pitch 개루프 스위치 변경: %d", pitch_open_loop_);
+                continue;
+            }
             if (n == "rc_deadband")       { rc_deadband_       = (int)prm.as_int(); RCLCPP_WARN(this->get_logger(), "[PID Control] rc_deadband = %d", rc_deadband_); continue; }
             if (n == "throttle_deadband") { throttle_deadband_ = (int)prm.as_int(); RCLCPP_WARN(this->get_logger(), "[PID Control] throttle_deadband = %d", throttle_deadband_); continue; }
             const float v = (float)prm.as_double();
@@ -408,7 +431,14 @@ private:
 
         // 축별 제어 출력 u = P + I + D
         float u_roll = (kp_r_ * err_roll) + (ki_r_ * err_sum_roll_) + (kd_r_ * d_roll);
-        float u_pitch = (kp_p_ * err_pitch) + (ki_p_ * err_sum_pitch_) + (kd_p_ * d_pitch);
+        // pitch 개루프(판별 실험용): AUTO 이고 스위치가 켜져 있으면 측정 pitch 를 쓰지 않는다.
+        // 핀 = kp_pitch × 목표 pitch (dive 15° → 8.75×15 = 131us → M1 1631 / M2 1368 고정).
+        // 적분·미분 상태는 비워 둔다 — 스위치를 끈 순간 쌓인 값이 튀어나오지 않게.
+        const bool pitch_ol = is_auto_mode_ && pitch_open_loop_;
+        if (pitch_ol) { err_sum_pitch_ = 0.0f; prev_err_pitch_ = 0.0f; }
+        float u_pitch = pitch_ol
+            ? (kp_p_ * target_pitch)
+            : (kp_p_ * err_pitch) + (ki_p_ * err_sum_pitch_) + (kd_p_ * d_pitch);
 
         // ---- 모터 믹싱 ----
         // 좌우 가슴지느러미 서보를 차동 구동한다:
@@ -448,6 +478,14 @@ private:
         }
 
         motor_pub_->publish(motor_output_msg);
+
+        // 진단: 그 순간의 게인·개루프 스위치·목표값. 제어에는 쓰이지 않는다.
+        // **페일세이프·완전정지로 조기 return 한 경로에서는 발행되지 않는다** — 그 구간의
+        // CSV 열에는 직전 값이 남고, 그게 맞다(그때는 PID 가 돌지 않았다는 뜻이므로
+        // State/Mode 열로 구분된다).
+        std_msgs::msg::Float32MultiArray dbg;
+        dbg.data = { kp_p_, pitch_ol ? 1.0f : 0.0f, target_pitch, target_roll };
+        debug_pub_->publish(dbg);
     }
 
     // PID 게인 (r=roll, p=pitch). 요 게인은 없다 — 요 제어 없음 (2026-09-14)
@@ -456,6 +494,7 @@ private:
     float i_limit_;                                          // 적분 누산 한계 (안티 와인드업)
     bool servo_rev_l_, servo_rev_r_;                         // 채널별 장착 방향 반전 (요 서보는 고정이라 없음)
     bool invert_pitch_, invert_roll_;                        // 축별 부호 반전 (믹싱 이전)
+    bool pitch_open_loop_;                                   // pitch 개루프 (판별 실험용, 2026-10-14)
     bool swap_rc_rp_;                                        // 수동 스틱 롤<->피치 스왑
     bool rc_inv_roll_, rc_inv_pitch_;                        // 수동 스틱 부호 반전 (AUTO 제외)
     int  rc_deadband_, throttle_deadband_;                   // 스틱 데드밴드 [카운트]
@@ -475,6 +514,7 @@ private:
     rclcpp::Time last_valid_rc_time_;  // 마지막으로 정상 조종기 패킷을 받은 시각
 
     rclcpp::Publisher<std_msgs::msg::UInt16MultiArray>::SharedPtr motor_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr debug_pub_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3>::SharedPtr attitude_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Quaternion>::SharedPtr rc_cmd_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Quaternion>::SharedPtr auto_cmd_sub_;
