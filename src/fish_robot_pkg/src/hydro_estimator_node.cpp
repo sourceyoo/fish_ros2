@@ -303,7 +303,8 @@ public:
                             RCLCPP_ERROR(this->get_logger(), "[Hydro] %s", r.reason.c_str());
                             break;
                         }
-                        if      (n == "wet_zero_still_depth_rate_mm_s") wz_rate_max_      = v;
+                        if      (n == "wet_zero_min_gauge_mbar")        wz_min_gauge_     = v;
+                        else if (n == "wet_zero_still_depth_rate_mm_s") wz_rate_max_      = v;
                         else if (n == "wet_zero_still_gyro_dps")        wz_gyro_max_      = v;
                         else if (n == "wet_zero_still_min_sec")         wz_still_min_sec_ = v;
                         else if (n == "wet_zero_fallback_sec")          wz_fallback_sec_  = v;
@@ -312,8 +313,10 @@ public:
                     }
                     RCLCPP_WARN(this->get_logger(),
                         "[Hydro] %s 변경 -> 대기창 영점: %s, 정지 기준 수심변화 < %.1f mm/s & 자이로 < %.1f dps "
-                        "(창 %.1f초), 연속 %.1f초, 폴백 %.1f초, 최소 %d샘플  (**다음 AUTO 진입부터 적용**)",
-                        n.c_str(), wz_enable_ ? "켜짐" : "꺼짐", wz_rate_max_, wz_gyro_max_, wz_window_sec_,
+                        "& 게이지 >= %.1f mbar (창 %.1f초), 연속 %.1f초, 폴백 %.1f초, 최소 %d샘플"
+                        "  (**다음 AUTO 진입부터 적용**)",
+                        n.c_str(), wz_enable_ ? "켜짐" : "꺼짐", wz_rate_max_, wz_gyro_max_,
+                        wz_min_gauge_, wz_window_sec_,
                         wz_still_min_sec_, wz_fallback_sec_, wz_min_samples_);
                 }
                 return r;
@@ -418,11 +421,28 @@ private:
         // 22샘플 중앙값이 ±0.05 mbar 가 되는 길이다.
         wz_enable_        = this->declare_parameter<bool>("wet_zero_enable", true);
         wz_rate_max_      = this->declare_parameter<double>("wet_zero_still_depth_rate_mm_s", 5.0);
-        wz_gyro_max_      = this->declare_parameter<double>("wet_zero_still_gyro_dps", 5.0);
+        // 7.0 으로 완화 (2026-10-29). 5.0 은 실측 로그 100개 WAIT 창에서 src=1(정지 구간)
+        // 비율이 43% 뿐이고 나머지는 폴백(src=2)으로 떨어졌다 — 정지로 판정된 샘플의 자이로가
+        // 4.0~4.9 dps 로 문턱에 거의 붙어 있었기 때문이다. 설계 당시 근거였던 0915 실측도
+        // "정지 부유 6.2~6.5 dps" 였으니 문턱 5 는 처음부터 측정값보다 낮았다.
+        // 7.0 으로 올리면 src=1 이 68% 로 오르고, **기존에 src=1 이던 창의 영점은 평균
+        // 0.010 mbar 만 움직인다**(센서 잡음 0.19 의 1/20) — 잘 잡히던 것을 망치지 않는다.
+        // 바이어스 포함 원시 자이로를 쓰므로(오프라인 재현용) 세션별 바이어스가 크기에
+        // 그대로 더해지는 것도 감안한 값이다. 8.0 은 +4% 뿐이고 들어올림 구간(8~10 dps)에
+        // 가까워져 택하지 않았다.
+        wz_gyro_max_      = this->declare_parameter<double>("wet_zero_still_gyro_dps", 7.0);
         wz_still_min_sec_ = this->declare_parameter<double>("wet_zero_still_min_sec", 2.0);
         wz_fallback_sec_  = this->declare_parameter<double>("wet_zero_fallback_sec", 2.0);
         wz_min_samples_   = this->declare_parameter<int>("wet_zero_min_samples", 5);
         wz_window_sec_    = this->declare_parameter<double>("wet_zero_window_sec", 1.0);   // 변화율·자이로 평균 창
+        // 정지 판정에 "물속인가"를 더한다 (2026-10-29). 10-24 로그에서 대기 중 로봇을 손으로
+        // **들어올렸다 다시 넣은** 창이 있었고, 입수 **전** 공기 중 구간(자이로 5.3~6.3,
+        // 수심 변화 ~0)이 정지로 판정돼 공기 중 q 가 영점이 될 수 있었다 — 물속 값과
+        // 2.46 mbar 차이(= 0.7 m/s 급)다. 조종기가 물속에서 끊겨 버튼을 누른 뒤 손으로
+        // 넣는 운용이라 "대기 중엔 이미 물속"을 가정할 수 없다. collect_q_zero 가 쓰는
+        // min_submerged_mbar(3.0) 와 같은 기준이되, 대기 영점은 더 보수적으로 가도 되므로
+        // 따로 둔다. 0 이하로 두면 이 검사를 끈다.
+        wz_min_gauge_     = this->declare_parameter<double>("wet_zero_min_gauge_mbar", 3.0);
 
         K_ = rho_ * gravity_ / 100.0;
 
@@ -455,9 +475,10 @@ private:
                                         " wz_zero, wz_src, wz_t0_age, wz_t1_age, wz_still, q_wz, speed_wz]");
         RCLCPP_INFO(this->get_logger(),
                     "[Hydro] 대기창 물속 영점: %s — AUTO 대기(/auto/state=1) 중 정지 구간(수심변화 < %.1f mm/s & "
-                    "자이로 < %.1f dps, 연속 %.1f초)의 q 중앙값. 없으면 마지막 %.1f초 폴백, %d샘플 미만이면 영점 없음",
-                    wz_enable_ ? "켜짐" : "**꺼짐**", wz_rate_max_, wz_gyro_max_, wz_still_min_sec_,
-                    wz_fallback_sec_, wz_min_samples_);
+                    "자이로 < %.1f dps & 게이지 >= %.1f mbar, 연속 %.1f초)의 q 중앙값. "
+                    "없으면 마지막 %.1f초 폴백, %d샘플 미만이면 영점 없음",
+                    wz_enable_ ? "켜짐" : "**꺼짐**", wz_rate_max_, wz_gyro_max_, wz_min_gauge_,
+                    wz_still_min_sec_, wz_fallback_sec_, wz_min_samples_);
         RCLCPP_INFO(this->get_logger(), "[Hydro]       /sensor/pressure_calibrated (EKF에서 이관 — 발행자는 반드시 1개)");
         RCLCPP_INFO(this->get_logger(), "[Hydro] 재영점: btn1 롱프레스 3초(공기 중에서만), 또는 서비스 /hydro/zero_atm");
         RCLCPP_INFO(this->get_logger(), "[Hydro] q 영점: %s  (물속 재포착: /hydro/zero_q)",
@@ -863,8 +884,13 @@ private:
 
     // 정지 판정. 수심 변화율은 최근 창의 정압 평균을 시간에 선형회귀한 기울기[mm/s],
     // 자이로는 같은 창의 |ω| 평균[도/초]. 둘 다 있어야 하고 둘 다 문턱 아래여야 정지다.
-    bool wz_is_still(double &rate_mm_s, double &gyro_dps) const {
+    // **셋째 조건: 물속이어야 한다.** 공기 중에 가만히 들고 있어도 앞 두 조건은 통과하는데
+    // (오히려 물속보다 더 조용하다) 그때의 q 는 물속 영점으로 쓸 수 없다. 2026-10-29 추가.
+    bool wz_is_still(double &rate_mm_s, double &gyro_dps, double &gauge) const {
         rate_mm_s = NAN; gyro_dps = NAN;
+        // 게이지압은 마지막 유효값을 쓴다 — 신선도는 호출부가 압력 샘플마다 부르는 것으로
+        // 보장된다(정압 전멸이면 NaN 이 되어 아래 비교가 false 로 떨어진다).
+        gauge = (double)last_static_gauge_;
         if (rate_buf_.size() >= 10) {  // 19.3 Hz 창의 절반 이상 — 샘플 유실에 대한 여유
             const rclcpp::Time t0 = rate_buf_.front().t;
             double n = 0.0, sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
@@ -883,8 +909,11 @@ private:
             for (const auto &g : gyro_buf_) sum += g.v;
             gyro_dps = sum / gyro_buf_.size();
         }
+        const bool submerged = (active_wz_min_gauge_ <= 0.0)
+                             || (std::isfinite(gauge) && gauge >= active_wz_min_gauge_);
         return std::isfinite(rate_mm_s) && std::isfinite(gyro_dps)
-            && std::abs(rate_mm_s) < active_wz_rate_max_ && gyro_dps < active_wz_gyro_max_;
+            && std::abs(rate_mm_s) < active_wz_rate_max_ && gyro_dps < active_wz_gyro_max_
+            && submerged;
     }
 
     void wz_begin_wait() {
@@ -899,14 +928,16 @@ private:
         active_wz_still_min_sec_ = wz_still_min_sec_;
         active_wz_fallback_sec_  = wz_fallback_sec_;
         active_wz_min_samples_   = wz_min_samples_;
+        active_wz_min_gauge_     = wz_min_gauge_;
         if (!wz_enable_) {
             RCLCPP_INFO(this->get_logger(), "[Hydro] AUTO 대기 시작 — 대기창 영점은 **꺼져 있음** (wet_zero_enable=false)");
             return;
         }
         RCLCPP_INFO(this->get_logger(),
-            "[Hydro] AUTO 대기 시작 — 대기창 물속 영점 수집 (정지 기준: 수심변화 < %.1f mm/s & 자이로 < %.1f dps, "
-            "연속 %.1f초; 없으면 마지막 %.1f초 폴백)",
-            active_wz_rate_max_, active_wz_gyro_max_, active_wz_still_min_sec_, active_wz_fallback_sec_);
+            "[Hydro] AUTO 대기 시작 — 대기창 물속 영점 수집 (정지 기준: 수심변화 < %.1f mm/s & 자이로 < %.1f dps "
+            "& 게이지 >= %.1f mbar, 연속 %.1f초; 없으면 마지막 %.1f초 폴백)",
+            active_wz_rate_max_, active_wz_gyro_max_, active_wz_min_gauge_,
+            active_wz_still_min_sec_, active_wz_fallback_sec_);
     }
 
     void wz_cancel() {
@@ -1240,16 +1271,16 @@ private:
             // q 는 q_offset 을 빼지 않은 (q_raw − dP_hydro) 다 — 이 영점이 Δb 까지 흡수한다.
             const double q_plain = have_att ? ((double)q_raw - (double)dph) : NAN;
             if (wz_enable_ && auto_state_ == AUTO_STATE_WAIT) {
-                double rate = NAN, gyro = NAN;
-                const bool still  = wz_is_still(rate, gyro);
+                double rate = NAN, gyro = NAN, gauge = NAN;
+                const bool still  = wz_is_still(rate, gyro, gauge);
                 // 자세가 없으면 q 가 NaN 이라 중앙값에 못 넣는다. 정지여도 "쓸 수 없음"이다.
                 const bool usable = still && std::isfinite(q_plain);
                 wz_buf_.push_back(WzSample{last_press_time_, q_plain, usable});
                 if (wz_buf_.size() > WZ_BUF_MAX) wz_buf_.pop_front();
                 wz_still_out = still;
                 RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                    "[Hydro] 대기창 수집 %zu샘플 — 수심변화 %.1f mm/s, 자이로 %.1f dps -> %s%s",
-                    wz_buf_.size(), rate, gyro, still ? "정지" : "움직임",
+                    "[Hydro] 대기창 수집 %zu샘플 — 수심변화 %.1f mm/s, 자이로 %.1f dps, 게이지 %.2f mbar -> %s%s",
+                    wz_buf_.size(), rate, gyro, gauge, still ? "정지" : "움직임",
                     (still && !usable) ? " (자세 없음 -> 못 씀)" : "");
             }
             if (std::isfinite(q_plain) && std::isfinite(q_wz_)) {
@@ -1556,6 +1587,8 @@ private:
     std::vector<double> q_acc_;
     std::vector<float>  q_air_acc_;   // 대기압 수집 중 함께 모으는 차압 (acc_ 와 형 일치)
     bool          q_zero_from_air_ = false;
+    double        wz_min_gauge_      = 3.0;
+    double        active_wz_min_gauge_ = 3.0;
     double        q_lpf_             = 0.0;
     bool          q_lpf_seeded_      = false;
     int           q_neg_run_         = 0;
