@@ -201,6 +201,16 @@ upper clamp (covariance adjusts trust). §1.3.
   0.01 °C LSB, while that second 40 ms wait was half the period; (2) the per-conversion wait went
   40 → 30 ms (`CONV_TICKS=3`) against a 17.2 ms datasheet max, still 1.7× headroom. Noise is unchanged
   (0.18/0.22/0.20 mbar at 19.3 Hz vs 0.14/0.25/0.21 at 11 Hz — same order, within per-unit spread).
+  **Raising the sample rate by lowering OSR was tested and rejected (2026-10-28).** With the period
+  held fixed (`CONV_TICKS=3`, 19.30 Hz both runs, zero dropouts), dropping D1 from OSR 8192 to 2048
+  made the per-sample σ **2.01× worse** (ch0 2.08 / ch1 2.01 / ch2 1.95) — matching the datasheet's
+  ~2.0× ratio. So the per-sample noise is dominated by the chip's own oversampling, and the 9–12×
+  excess over datasheet does **not** come from outside the chip; trading OSR for more samples buys
+  nothing after averaging. Keep 8192. Separately, the **1-second average is not limited by per-sample
+  noise at all**: averaging 19 samples should cut σ by √19.3 = 4.4× but only cuts it 2.2–3.7× (0-stage
+  baseline), and the 1 s SD actually *fell* at OSR 2048 — a low-frequency component dominates there,
+  which neither OSR nor sample rate touches. Anything averaged at ~1 s (depth, speed) is capped by
+  that, not by OSR.
   **A skipped cycle reuses D2 only when `d2_ok[]` says the last collection succeeded**; a failed one
   is zeroed so the conversion guard emits NaN — otherwise this would resurrect the "dead sensor keeps
   publishing its last value" trap. `hydro_estimator_node` hardcoded 11 Hz in five places (LPF `dt`,
