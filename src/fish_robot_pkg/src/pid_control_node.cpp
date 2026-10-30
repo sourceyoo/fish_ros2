@@ -4,6 +4,8 @@
 //  역할 : 자세 오차를 PID로 보정해 최종 모터 4채널 출력을 만드는 제어기
 //
 //   [입력] /filtered/attitude  (Vector3)    <- 현재 자세 + 모드 플래그
+//          /filtered/angular_rate (Vector3) <- 각속도 [도/초, FLU, 바이어스 제거]
+//                                            pitch 종속 제어용 (2026-10-30). 기본 꺼짐
 //          /rc/command         (Quaternion) <- 조종기 목표값 (수동 모드)
 //          /auto/command       (Quaternion) <- 시나리오 목표값 (자동 모드).
 //                                            z = 서보 고정 플래그 (2026-09-16, 아래 참조)
@@ -59,6 +61,54 @@
 #define SERVO_MIN_US 1325
 #define SERVO_MAX_US 1675
 
+// =============================================================================
+//  pitch 종속(각속도) 제어 — 2026-10-30
+// =============================================================================
+//  왜: 지금 pitch 는 각도 오차에 P만 쓴다 (ki/kd 전부 0). 목표에 가까워질 때
+//  **제동이 없어** 관성으로 지나치고 되돌아오는 진동이 구조적으로 남는다.
+//  교과서적 답은 kd 지만 이 구현은 dt 를 곱하지 않으므로(규칙 5) D 를 켜는 순간
+//  게인 의미가 깨진다. 그래서 자이로로 각속도를 **직접 측정**해 쓴다 — 미분이
+//  없으니 dt 문제를 피해 간다.
+//
+//  구조:
+//    목표각속도 = kp_pitch_angle * 각도오차        [도/초]
+//    목표각속도 = clamp(목표각속도, ±pitch_rate_max)
+//    각속도오차 = 목표각속도 − 측정각속도(LPF)      [도/초]
+//    u_pitch   = kp_pitch * (각도오차 + kp_pitch_rate * 각속도오차)
+//
+//  **단위를 반드시 보라**: kp_pitch 는 us/도 다 (8.75 = 175us/20°, 아래 생성자
+//  주석). 그래서 각속도 항을 kp_pitch **안쪽**에 넣어 "등가 각도" 로 환산한다.
+//  바깥에 더하면 us 와 도/초 를 섞게 되고 게인 스케일이 통째로 틀어진다.
+//  kp_pitch_rate 의 단위는 도/(도/초) = 초다.
+//
+//  **기본값 kp_pitch_rate = 0 → 거동이 지금과 수학적으로 완전히 동일하다.**
+//  코드만 들어가고 출력은 1 us 도 안 바뀐다. 물에서 ros2 param set 으로 조금씩
+//  올리며 튜닝하고, 이상하면 0 으로 되돌리면 즉시 원복이다 (재빌드 불필요).
+//
+//  실측 근거 (10-19~10-26 주행 로그 96개 RUN 구간, pitch 각속도 도/초):
+//      static 0.5(p50)/7.1(p90)   straight 4.8/12.8
+//      dive   5.8/19.0            dive_hold 12.9/35.3
+//    - pitch_rate_max 40: 가장 격한 dive_hold p90 35.3 바로 위. 실제 거동을
+//      막지 않으면서 그 위를 자른다. 처음 추정 30 은 dive_hold 를 깎았다.
+//    - kp_pitch_angle 4.0: 역수 0.25초 = "틀어진 각도를 0.25초에 지우려는 속도".
+//      dive 실측과 맞는다. 처음 추정 2.0(0.5초)은 실제보다 느렸다.
+//    - pitch_rate_lpf_tau 0.05: straight 는 목표 0° 인데도 4.8 도/초가 나온다
+//      (static 의 10배) — 자세가 틀어진 게 아니라 **꼬리 박자에 몸통이 떠는
+//      것**이다. 필터 없이 각속도 항에 넣으면 지느러미가 그 떨림에 맞춰 흔들려
+//      서보 수명만 깎는다. 제어 시간상수(0.25초)의 1/5 이라 제어 대역은 거의
+//      건드리지 않는다. 키우면 매끄러워지지만 각속도가 늦게 와 제동이 늦은
+//      제동이 되고, 그건 진동의 원인이다.
+//
+//  ※ 부호: 이 로봇은 **양수 pitch = 기수 아래**로 항공 관례와 반대다
+//    (CLAUDE.md Known gaps). 각속도 부호가 반대면 **제동이 가속이 된다.**
+//    kp_pitch_rate 를 0 보다 올리기 전에 반드시 벤치에서 손으로 기울여
+//    확인할 것 — PWM 이나 부호 추론으로 판정하지 말 것 (믹싱 주석의 2026-09-04
+//    교훈과 같은 종류의 함정이다).
+//  ※ roll 은 건드리지 않았다. 종속 제어는 pitch 에만 넣는다 — 실측 근거가
+//    pitch 각속도뿐이고, roll 까지 동시에 바꾸면 물에서 원인 분리가 안 된다.
+// =============================================================================
+#define PITCH_RATE_DEFAULT_MAX 40.0f    // [도/초] 목표 각속도 상한
+
 class PidControlNode : public rclcpp::Node {
 public:
     PidControlNode() : Node("pid_control_node"),
@@ -69,6 +119,10 @@ public:
                        // ※ 벤치용 정적 배율이다 — 물에서 출렁이면 낮추는 게 §5 튜닝.
                        kp_r_(8.75f), ki_r_(0.0f), kd_r_(0.0f),
                        kp_p_(8.75f), ki_p_(0.0f), kd_p_(0.0f),
+                       // pitch 종속(각속도) 제어. kp_p_rate_ 0 = 꺼짐 = 기존 거동.
+                       kp_p_angle_(4.0f), kp_p_rate_(0.0f),
+                       rate_max_(PITCH_RATE_DEFAULT_MAX), rate_lpf_tau_(0.05f),
+                       rate_max_age_(0.05),
                        i_limit_(300.0f),                       // 적분 와인드업 상한 (ki=0인 지금은 무효)
                        // 서보 방향: 우측 지느러미는 몸 반대편에 **거울상으로 장착**돼
                        // 같은 PWM 증가가 물리적으로 반대 회전이 된다. 실측(2026-08-26):
@@ -130,6 +184,14 @@ public:
         // pitch 개루프 스위치 (2026-10-14, 판별 실험용). true + AUTO 이면 pitch 핀을 측정 pitch 없이
         // kp_pitch × 목표 pitch 로만 낸다. roll 은 그대로 피드백. 기본 false = 기존 동작과 동일.
         pitch_open_loop_ = this->declare_parameter<bool>("pitch_open_loop", pitch_open_loop_);
+
+        // pitch 종속(각속도) 제어 — 전부 live-settable. 파일 상단 설계 주석 참조.
+        // kp_pitch_rate 기본 0 = 각속도 항 무효 = 지금과 동일한 거동.
+        kp_p_angle_   = (float)this->declare_parameter<double>("kp_pitch_angle",    (double)kp_p_angle_);
+        kp_p_rate_    = (float)this->declare_parameter<double>("kp_pitch_rate",     (double)kp_p_rate_);
+        rate_max_     = (float)this->declare_parameter<double>("pitch_rate_max",    (double)rate_max_);
+        rate_lpf_tau_ = (float)this->declare_parameter<double>("pitch_rate_lpf_tau",(double)rate_lpf_tau_);
+        rate_max_age_ =        this->declare_parameter<double>("pitch_rate_max_age", rate_max_age_);
         swap_rc_rp_   = this->declare_parameter<bool>("swap_rc_roll_pitch", swap_rc_rp_);
         rc_inv_roll_  = this->declare_parameter<bool>("invert_rc_roll",  rc_inv_roll_);
         rc_inv_pitch_ = this->declare_parameter<bool>("invert_rc_pitch", rc_inv_pitch_);
@@ -162,12 +224,32 @@ public:
         RCLCPP_INFO(this->get_logger(),
             "=== [PID Control] 런타임 튜닝: ros2 param set /pid_control_node kp_pitch <값> ===");
 
+        // 종속 제어 상태를 기동 때 명시한다. 꺼져 있다는 사실이 로그에 남아야
+        // "코드는 들어갔는데 왜 거동이 같나" 를 journal 에서 바로 확인할 수 있다.
+        if (kp_p_rate_ == 0.0f) {
+            RCLCPP_WARN(this->get_logger(),
+                "[PID Control] pitch 종속(각속도) 제어 **꺼짐** (kp_pitch_rate=0) "
+                "-> 각도 P 단독, 기존 거동과 동일. 켜기: ros2 param set "
+                "/pid_control_node kp_pitch_rate <값>  (부호 벤치 확인 선행 필수)");
+        } else {
+            RCLCPP_WARN(this->get_logger(),
+                "[PID Control] pitch 종속(각속도) 제어 켜짐: kp_rate=%.3f s, "
+                "kp_angle=%.2f 1/s, rate_max=%.1f 도/초, LPF tau=%.3f s, max_age=%.0f ms",
+                kp_p_rate_, kp_p_angle_, rate_max_, rate_lpf_tau_, rate_max_age_ * 1000.0);
+        }
+
         motor_pub_ = this->create_publisher<std_msgs::msg::UInt16MultiArray>("/motor/output", 10);
 
         // 진단 전용. 숫자 네 개라 커스텀 메시지를 만들지 않는 관례를 따른다.
         debug_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/pid/debug", 10);
 
         // 이 구독이 제어 루프의 심장이다 (콜백 안에서 PID 연산 + 발행까지 수행)
+        // 각속도 구독 (pitch 종속 제어용). depth 1 — 최신값만 쓸모가 있다.
+        // 낡은 각속도로 제동을 걸면 진동의 원인이 되므로 쌓아둘 이유가 없다.
+        angular_rate_sub_ = this->create_subscription<geometry_msgs::msg::Vector3>(
+            "/filtered/angular_rate", 1,
+            std::bind(&PidControlNode::angular_rate_callback, this, std::placeholders::_1));
+
         attitude_sub_ = this->create_subscription<geometry_msgs::msg::Vector3>(
             "/filtered/attitude", 10, std::bind(&PidControlNode::attitude_callback, this, std::placeholders::_1));
 
@@ -284,12 +366,49 @@ private:
             else if (n == "ki_pitch") { ki_p_ = v; err_sum_pitch_ = 0.0f; }
             else if (n == "kd_pitch") kd_p_ = v;
             else if (n == "i_limit")  i_limit_ = v;
+            else if (n == "kp_pitch_angle")     kp_p_angle_ = v;
+            else if (n == "kp_pitch_rate")      kp_p_rate_  = v;
+            else if (n == "pitch_rate_max")     rate_max_   = v;
+            else if (n == "pitch_rate_lpf_tau") rate_lpf_tau_ = v;
+            else if (n == "pitch_rate_max_age") rate_max_age_ = (double)v;
             else continue;
             RCLCPP_WARN(this->get_logger(), "[PID Control] 게인 변경: %s = %.3f", n.c_str(), v);
         }
         rcl_interfaces::msg::SetParametersResult res;
         res.successful = true;
         return res;
+    }
+
+    // 각속도 수신 (pitch 종속 제어용, 2026-10-30)
+    //  - y 축만 쓴다 (pitch). FLU 이고 단위는 도/초, 바이어스는 EKF 가 이미 뺐다.
+    //  - LPF 는 **여기서** 건다. 꼬리 박자 떨림(straight 4.8 도/초, static 의 10배)을
+    //    제어에 그대로 넣지 않기 위한 것이다. 파일 상단 설계 주석 참조.
+    //  - dt 는 발행 간격을 실측해서 쓴다. attitude 와 같은 콜백에서 나오므로
+    //    100Hz 가 정상이지만, 고정 0.01 로 가정하면 레이트가 흔들릴 때 시간상수가
+    //    조용히 틀어진다 (2026-10-30 의 DDS 중복 전달이 바로 그런 사례였다).
+    void angular_rate_callback(const geometry_msgs::msg::Vector3::SharedPtr msg) {
+        const float raw = (float)msg->y;
+        if (std::isnan(raw)) return;          // NaN 은 LPF 상태를 영구 오염시킨다
+
+        const rclcpp::Time now = this->now();
+        float dt = 0.01f;
+        if (rate_initialized_) {
+            const double d = (now - last_rate_time_).seconds();
+            // 비정상 간격(음수/정체/과대)은 dt 로 쓰지 않고 공칭값으로 둔다.
+            if (d > 0.0 && d < 0.5) dt = (float)d;
+        }
+        last_rate_time_ = now;
+
+        if (!rate_initialized_) {
+            pitch_rate_ = raw;                // 첫 샘플은 필터를 통과시킨다
+            rate_initialized_ = true;
+        } else if (rate_lpf_tau_ <= 0.0f) {
+            pitch_rate_ = raw;                // tau<=0 = 필터 끔
+        } else {
+            // 1차 IIR. alpha = dt/(tau+dt) 형태라 dt 가 변해도 시간상수가 유지된다.
+            const float a = dt / (rate_lpf_tau_ + dt);
+            pitch_rate_ += a * (raw - pitch_rate_);
+        }
     }
 
     // 서보 출력 클램프: 기구부가 물리적으로 낼 수 있는 각도 밖으로 나가지 않게 막는다.
@@ -436,9 +555,45 @@ private:
         // 적분·미분 상태는 비워 둔다 — 스위치를 끈 순간 쌓인 값이 튀어나오지 않게.
         const bool pitch_ol = is_auto_mode_ && pitch_open_loop_;
         if (pitch_ol) { err_sum_pitch_ = 0.0f; prev_err_pitch_ = 0.0f; }
+
+        // ---- pitch 종속(각속도) 제어 ----
+        // 각도오차에 "각속도오차 × kp_pitch_rate" 를 **등가 각도로** 더해 kp_pitch
+        // 한 번만 곱한다. kp_pitch 가 us/도 이므로 바깥에서 더하면 단위가 섞인다
+        // (파일 상단 설계 주석).
+        //
+        // 각속도를 쓰지 않는 조건 세 가지 — 어느 하나라도 걸리면 각도 제어로
+        // 자동 복귀한다. **0 을 쓰지 않고 항 자체를 빼는** 이유: 각속도 0 은
+        // "정지" 를 뜻하므로, 실제로는 돌고 있는데 0 을 넣으면 제동이 아니라
+        // 엉뚱한 가속 명령이 된다.
+        //   1) kp_pitch_rate == 0        : 기능 꺼짐 (기본값)
+        //   2) 아직 한 번도 못 받음      : 초기화 전
+        //   3) 받은 값이 너무 낡음       : EKF 멎음/토픽 끊김. 낡은 각속도로 거는
+        //      제동은 이미 지나간 움직임에 반응하는 것이라 진동을 키운다.
+        float rate_err = 0.0f;
+        bool  rate_used = false;
+        if (kp_p_rate_ != 0.0f && rate_initialized_) {
+            const double age = (this->now() - last_rate_time_).seconds();
+            if (age >= 0.0 && age <= rate_max_age_) {
+                // 목표 각속도 = 각도오차 × kp_pitch_angle, ±rate_max 로 제한.
+                // 제한이 없으면 큰 각도에서 로봇이 못 내는 속도를 명령해 지느러미가
+                // 끝에 붙어 있는 동안 제어가 사실상 먹지 않는다.
+                float rate_cmd = kp_p_angle_ * err_pitch;
+                if (rate_cmd >  rate_max_) rate_cmd =  rate_max_;
+                else if (rate_cmd < -rate_max_) rate_cmd = -rate_max_;
+                rate_err  = rate_cmd - pitch_rate_;
+                rate_used = true;
+            } else {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                    "[PID Control] 각속도 %.0f ms 지연 -> 이번 주기 각도 제어로 복귀", age * 1000.0);
+            }
+        }
+
+        // 개루프일 때는 종속 항도 쓰지 않는다 — 개루프의 정의가 "측정 pitch 를
+        // 쓰지 않는다" 이고, 각속도는 측정값이다.
         float u_pitch = pitch_ol
             ? (kp_p_ * target_pitch)
-            : (kp_p_ * err_pitch) + (ki_p_ * err_sum_pitch_) + (kd_p_ * d_pitch);
+            : (kp_p_ * (err_pitch + kp_p_rate_ * rate_err))
+              + (ki_p_ * err_sum_pitch_) + (kd_p_ * d_pitch);
 
         // ---- 모터 믹싱 ----
         // 좌우 가슴지느러미 서보를 차동 구동한다:
@@ -484,7 +639,13 @@ private:
         // CSV 열에는 직전 값이 남고, 그게 맞다(그때는 PID 가 돌지 않았다는 뜻이므로
         // State/Mode 열로 구분된다).
         std_msgs::msg::Float32MultiArray dbg;
-        dbg.data = { kp_p_, pitch_ol ? 1.0f : 0.0f, target_pitch, target_roll };
+        // 0~3 은 **순서를 바꾸지 말 것** — data_logger_node 가 CSV 69~72열로 읽는다
+        // (size()<4 검사 후 인덱스 0~3만 읽으므로 뒤에 덧붙이는 것은 무해하다).
+        // 4~6 은 종속 제어 진단 (2026-10-30): 각속도를 실제로 썼는지, 그때 측정
+        // 각속도와 각속도오차가 얼마였는지. 튜닝 중 "제동이 걸렸나" 를 로그로
+        // 확인하려면 이 셋이 필요하다.
+        dbg.data = { kp_p_, pitch_ol ? 1.0f : 0.0f, target_pitch, target_roll,
+                     rate_used ? 1.0f : 0.0f, pitch_rate_, rate_err };
         debug_pub_->publish(dbg);
     }
 
@@ -502,6 +663,16 @@ private:
     float prev_err_roll_, prev_err_pitch_;                   // D항 계산용 직전 오차
     float robot_roll_, robot_pitch_;                         // 현재 자세(측정값)
 
+    // pitch 종속(각속도) 제어 상태 (2026-10-30)
+    float kp_p_angle_;            // 각도오차 -> 목표각속도 [1/s]
+    float kp_p_rate_;             // 각속도오차 -> 등가각도 [s]. **0 = 꺼짐(기본)**
+    float rate_max_;              // 목표각속도 상한 [도/초]
+    float rate_lpf_tau_;          // 각속도 LPF 시간상수 [초]. <=0 이면 필터 끔
+    double rate_max_age_;         // 이보다 낡은 각속도는 쓰지 않는다 [초]
+    float pitch_rate_ = 0.0f;     // LPF 통과 pitch 각속도 [도/초]
+    bool  rate_initialized_ = false;
+    rclcpp::Time last_rate_time_{0, 0, RCL_ROS_TIME};
+
     int16_t rc_roll_, rc_pitch_, rc_throttle_;                   // 수동 목표값 (0.1도 / 스틱 raw)
     int16_t auto_roll_, auto_pitch_, auto_throttle_;             // 자동 목표값 (0.1도 / PWM)
     bool    auto_hold_;                                          // /auto/command z — 서보 고정(완전 정지)
@@ -516,6 +687,7 @@ private:
     rclcpp::Publisher<std_msgs::msg::UInt16MultiArray>::SharedPtr motor_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr debug_pub_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3>::SharedPtr attitude_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::Vector3>::SharedPtr angular_rate_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Quaternion>::SharedPtr rc_cmd_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Quaternion>::SharedPtr auto_cmd_sub_;
     rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr rpm_sub_;

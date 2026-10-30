@@ -258,6 +258,18 @@ public:
         // ── 제어 경로 이관분 (구 state_estimation_node 에서 승계) ──────────────
         attitude_pub_ = this->create_publisher<geometry_msgs::msg::Vector3>("/filtered/attitude", 10);
 
+        // ── /filtered/angular_rate — 바이어스를 뺀 각속도 [도/초, FLU] (2026-10-30) ──
+        // pid_control_node 의 pitch 종속(각속도) 제어가 쓴다. 각도 미분이 아니라
+        // 자이로 직측이므로 dt 생략 PID(규칙 5)의 게인 문제를 피해 간다.
+        //
+        // ※ /raw/imu_6dof 의 자이로와 **다른 값**이다. 여기는 EKF 가 추정한
+        //   바이어스 b_ 를 뺐고 FLU 로 변환됐다. 원시값이 필요한 소비자
+        //   (hydro_estimator_node 의 정지 판정 등)는 그대로 /raw/imu_6dof 를 써야
+        //   한다 — 대기창 영점 95회 검증(2026-10-29)이 원시 도/초 기준이고
+        //   7 dps 문턱도 거기서 나왔으므로 이 토픽으로 바꾸면 그 검증이 무효가 된다.
+        // ※ 단위는 **도/초**다. /raw/imu_6dof 와 같은 관례(규칙 2)로 맞췄다.
+        angular_rate_pub_ = this->create_publisher<geometry_msgs::msg::Vector3>("/filtered/angular_rate", 10);
+
         // 축 변환 검증용 발행 토픽. 필터에 실제로 들어가는 값을 그대로 내보내므로
         // /raw/* 와 나란히 echo 하면 회전이 의도대로 걸렸는지 눈으로 대조할 수 있다.
         //   /CH_IMU    <- /raw/imu_6dof     를 FLU로 회전한 값 (단위 그대로: g, 도/초)
@@ -792,6 +804,10 @@ private:
         // 더 신선하다. 순차 처리라 각 관측을 독립적으로 게이팅할 수 있고
         // 재선형화도 공짜로 따라온다.
         const Vec3 w_hat = gyro_rad - b_;
+        // 각속도 발행용으로 보관한다 (publish() 는 별 함수라 인자로 못 넘긴다).
+        // **바이어스를 뺀 FLU 값**이다 — 원시 자이로(/raw/imu_6dof)와는 다르다.
+        last_w_hat_ = w_hat;
+        has_w_hat_ = true;
         if (use_accel_) {
             if (update_accel(accel_g, w_hat)) { flags_ |= 0x02; accel_rej_run_ = 0; }
             else                              { flags_ |= 0x08; accel_rej_run_++; }
@@ -1397,6 +1413,19 @@ private:
         att.z = static_cast<double>(filtered_yaw);
         attitude_pub_->publish(att);
 
+        // ── 각속도 /filtered/angular_rate [도/초, FLU, 바이어스 제거] ──
+        // attitude 와 **같은 콜백·같은 주기**로 나간다. pid_control_node 는 자세
+        // 콜백에서 PID 를 도는데, 각속도가 그보다 늦게 오면 낡은 값으로 제동을
+        // 걸게 되고 그게 진동의 원인이 된다. 초기화 전(has_w_hat_=false)에는 아예
+        // 발행하지 않는다 — 0 을 보내면 "정지"로 읽혀 제동이 걸린다.
+        if (has_w_hat_) {
+            auto rate = geometry_msgs::msg::Vector3();
+            rate.x = static_cast<double>(last_w_hat_.x()) * R2D;
+            rate.y = static_cast<double>(last_w_hat_.y()) * R2D;
+            rate.z = static_cast<double>(last_w_hat_.z()) * R2D;
+            angular_rate_pub_->publish(rate);
+        }
+
         // ── 진단 토픽 /filtered/attitude_ekf — 오프셋도 모드 인코딩도 없는 순수값 ──
         // 비교 스크립트(exp_b.py 등)가 단순 뺄셈으로 쓰므로 이 규약은 유지한다.
         auto att_ekf = geometry_msgs::msg::Vector3();
@@ -1488,6 +1517,10 @@ private:
 
     // ---- yaw 영점 (btn2 짧게) ----
     float raw_yaw_;      // 헤딩 영점 적용 전 원시 yaw [도] — publish()에서 매 샘플 갱신
+
+    // 각속도 발행용 (2026-10-30). imu_callback 에서 계산하고 publish() 에서 쓴다.
+    Vec3 last_w_hat_ = Vec3::Zero();   // 바이어스 제거 각속도 [rad/s, FLU]
+    bool has_w_hat_ = false;           // 아직 한 번도 안 채워졌으면 발행하지 않는다
     float yaw_offset_;   // btn2 짧게 누름으로 잡은 기준 방향 [도]
 
     // ---- 지자기 캘리브레이션 (magneto_cal.py 서브프로세스) ----
@@ -1515,6 +1548,7 @@ private:
     rclcpp::Publisher<geometry_msgs::msg::Vector3>::SharedPtr attitude_ekf_pub_;      // /filtered/attitude_ekf (순수값)
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr status_pub_;       // /filtered/ekf_status
     rclcpp::Publisher<geometry_msgs::msg::Vector3>::SharedPtr attitude_pub_;          // /filtered/attitude (제어)
+    rclcpp::Publisher<geometry_msgs::msg::Vector3>::SharedPtr angular_rate_pub_;      // /filtered/angular_rate (제어, 도/초 FLU)
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr ch_imu_pub_;                  // /CH_IMU (검증용)
     rclcpp::Publisher<geometry_msgs::msg::Vector3>::SharedPtr ch_magnet_pub_;         // /CH_MEGNET (검증용)
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
