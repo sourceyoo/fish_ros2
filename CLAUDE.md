@@ -210,8 +210,17 @@ upper clamp (covariance adjusts trust). §1.3.
   nothing after averaging. Keep 8192. Separately, the **1-second average is not limited by per-sample
   noise at all**: averaging 19 samples should cut σ by √19.3 = 4.4× but only cuts it 2.2–3.7× (0-stage
   baseline), and the 1 s SD actually *fell* at OSR 2048 — a low-frequency component dominates there,
-  which neither OSR nor sample rate touches. Anything averaged at ~1 s (depth, speed) is capped by
-  that, not by OSR.
+  which neither OSR nor sample rate touches. **That component was identified on 2026-10-30 as sensor
+  warm-up temperature drift** (§13), by re-analysing the two existing 10-minute records — no new
+  measurement. It is common-mode across channels (1 s correlation r = +0.68…+0.85 on the cold-start
+  run vs +0.04…+0.11 on the warm one) and tracks temperature, which rose +0.6/+2.9/+3.0 °C during the
+  cold run. Excluding the warm-up half and regressing each channel's 1 s mean on its own temperature
+  leaves **1.03–1.26× the white-noise expectation** — i.e. nothing unexplained remains, and the two
+  records only looked contradictory because one started cold. So it is *not* an uncorrectable floor:
+  **measure after warming up.** The 3-channel average's 1 s σ is then 0.52–0.58 mm, harmless for a
+  cm-level depth loop, but differential-pressure attitude still sees it when per-channel temperature
+  sensitivities differ. Any pressure characterization must start ≥ 10 min after boot and keep the
+  temperature columns; comparing two records with different temperature spans is invalid.
   **A skipped cycle reuses D2 only when `d2_ok[]` says the last collection succeeded**; a failed one
   is zeroed so the conversion guard emits NaN — otherwise this would resurrect the "dead sensor keeps
   publishing its last value" trap. `hydro_estimator_node` hardcoded 11 Hz in five places (LPF `dt`,
