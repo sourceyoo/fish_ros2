@@ -1,9 +1,38 @@
 import os
 from launch import LaunchDescription
+from launch.actions import SetEnvironmentVariable
 from launch_ros.actions import Node
 
 def generate_launch_description():
     return LaunchDescription([
+        # 0. DDS 탐색 범위를 이 호스트 안으로 제한 (2026-10-30)
+        #    Jazzy 기본값은 SUBNET 이다 (/opt/ros/jazzy/share/ros_environment/
+        #    environment/1.ros_discovery.sh 가 set-if-unset 으로 심는다. 서비스
+        #    유닛에 Environment= 가 없어도 setup.bash 를 source 하므로 들어온다).
+        #    SUBNET + wlan0 활성이면 같은 Pi 안의 노드끼리도 공유메모리와 UDP
+        #    **두 경로로 같은 메시지가 각각 전달**된다. 받는 쪽은 중복인지 모르니
+        #    둘 다 처리한다. 실측 (2026-10-30, /raw/imu_6dof 전용 구독자):
+        #      SUBNET    : 199.5 Hz,  dt<=0  45.6 %,  dt 중앙 7.39 ms
+        #      LOCALHOST : 100.0 Hz,  dt<=0   0.0 %,  dt 중앙 10.00 ms
+        #    양방향 2회 재현 + 경로 수 0/1/2 용량-반응까지 확인했다.
+        #
+        #    피해가 두 가지다.
+        #    (1) 두 경로의 지연이 달라 과거 스탬프가 나중에 도착한다 →
+        #        state_estimation_ekf_node.cpp:739 의 dt<=0 "단절" 분기가 떠서
+        #        공분산을 계속 부풀린다. 10-30 13:08 기동분에서 누적 45만 회.
+        #    (2) /filtered/attitude 가 200 Hz 가 되고, pid_control_node 는 타이머
+        #        없이 그 콜백에서 PID 를 돌므로(CLAUDE.md 규칙 5) /motor/output 과
+        #        nRF UART 패킷도 두 배가 된다. 발행자가 둘일 때의 피해와 같다.
+        #
+        #    rcl/discovery_options.h:53 이 "향후 버전에서 LOCALHOST 를 기본값으로
+        #    할 의도" 라고 적고 있으니 상류가 가는 방향과도 같다.
+        #    ※ 영향 범위: 이 Pi 밖에 ROS2 를 설치해 네트워크 건너편에서 토픽을
+        #      직접 구독하는 방식만 막힌다. SSH 로 들어와서 쓰는 ros2 topic echo /
+        #      ros2 param set / rqt / journalctl 은 전부 그대로 된다(명령이 이 호스트
+        #      안에서 돌기 때문). 외부 모니터링이 필요해지면 SUBNET 으로 되돌리는
+        #      대신 ROS_DOMAIN_ID 를 기본 0 에서 바꿔 다른 기기와의 충돌만 막아라.
+        SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'LOCALHOST'),
+
         # 1. UART 브릿지 노드 (6축 및 RC 데이터 허브)
         Node(
             package='fish_robot_pkg',
