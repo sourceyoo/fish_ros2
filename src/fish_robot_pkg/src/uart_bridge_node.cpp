@@ -158,7 +158,6 @@ private:
     void uart_rx_loop() {
         if (uart_fd_ < 0) return;
 
-        unsigned char byte;
         // static: 타이머 호출 사이에 파싱 진행 상태를 유지한다.
         // (한 주기 안에 패킷이 반쪽만 도착해도 다음 주기에서 이어서 파싱)
         static uint8_t recvBuf[64];  // 46바이트 패킷보다 넉넉한 조립용 버퍼
@@ -167,10 +166,28 @@ private:
         bool packet_received = false;
         SensorPacket rxPkt;
 
-        // OS 로우 버퍼가 완전히 빌 때까지 패킷 스트림 동기 가동
-        // 논블로킹이므로 읽을 게 없으면 read()가 -1을 반환하며 루프 탈출.
-        // 한 주기에 패킷이 여러 개 들어오면 마지막 정상 패킷만 남아 발행된다(최신값 우선).
-        while (read(uart_fd_, &byte, 1) > 0) {
+        // OS 로우 버퍼가 완전히 빌 때까지 패킷 스트림 동기 가동.
+        // 논블로킹이므로 읽을 게 없으면 read()가 -1(EAGAIN)을 반환하며 루프 탈출.
+        //
+        // 2026-10-31: 바이트 단위 read() -> 덩어리 read(). 예전엔 바이트마다 syscall 을
+        // 했다 — 46바이트 패킷이면 틱당 47회(마지막 -1 포함), 초당 4,700회. 지금은 커널
+        // 버퍼에 쌓인 만큼 한 번에 끌어와(보통 46B = 1회) 같은 상태기계로 돌린다.
+        // 파싱 논리는 한 글자도 안 바뀌었다 — 바이트의 출처만 바뀌었다.
+        // 실측(가동 905초): uart 노드 5.3% 중 100Hz 노드의 바닥(scenario 4.0%)을 뺀
+        // 최대 1.3%p 가 이 루프 비용이었다. 작지만 공짜다.
+        //
+        // 한 주기에 패킷이 여러 개 들어오면 **마지막 정상 패킷만 남아 발행된다**(최신값
+        // 우선). 그 앞 패킷은 다 파싱해 놓고 조용히 덮어쓴다. 2026-10-31 실측 30초
+        // 2,888개에서 15~25ms 간격이 0개 — 지금은 안 일어난다. 하지만 nRF 클럭이 Pi
+        // 타이머보다 조금만 빨라지면 패킷이 **흔적 없이** 빠진다. EKF 유실 문턱이
+        // 50ms(DT_LONG_SEC)라 20ms 공백은 거기에도 안 잡힌다. 그래서 덮어쓴 횟수를
+        // 세고 처음과 누적 1000회마다 WARN 을 남긴다. 이 숫자가 0 이 아니면 "최신값
+        // 우선" 설계를 다시 보라는 신호다 (패킷마다 발행하도록 바꾸는 것이 답일 수 있다).
+        uint8_t chunk[256];
+        ssize_t n;
+        while ((n = read(uart_fd_, chunk, sizeof(chunk))) > 0) {
+          for (ssize_t ci = 0; ci < n; ci++) {
+            const unsigned char byte = chunk[ci];
             switch (state) {
                 case 0:  // 첫 동기화 바이트 0xBB 탐색
                     if (byte == 0xBB) { state = 1; recvBuf[0] = byte; bufIdx = 1; }
@@ -200,6 +217,15 @@ private:
                         bufIdx = 0;
 
                         if (rxXor == tempPkt.checksum) {
+                            if (packet_received) {
+                                // 같은 틱에 두 번째 유효 패킷 — 앞 것이 덮어써진다
+                                overwritten_count_++;
+                                if (overwritten_count_ == 1 || overwritten_count_ % 1000 == 0)
+                                    RCLCPP_WARN(this->get_logger(),
+                                        "[UART Bridge] 한 틱에 유효 패킷 2개 -> 앞 패킷 덮어씀 (누적 %u회). "
+                                        "nRF 가 Pi 타이머보다 빠르다는 뜻 — 0 이 아니면 설계를 다시 볼 것.",
+                                        overwritten_count_);
+                            }
                             rxPkt = tempPkt;        // 유효 패킷 채택
                             packet_received = true;
                         }
@@ -207,6 +233,7 @@ private:
                     }
                     break;
             }
+          }
         }
 
         // 패킷 무결성이 확보되면 ROS2 토픽 발행 처리
@@ -252,6 +279,7 @@ private:
     }
 
     int uart_fd_;                                   // UART 파일 디스크립터 (-1 = 미개방)
+    uint32_t overwritten_count_ = 0;                // 한 틱에 2개째 유효 패킷이 앞 것을 덮어쓴 횟수 (2026-10-31)
     rclcpp::TimerBase::SharedPtr uart_rx_timer_;    // 100Hz 수신 폴링 타이머
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Quaternion>::SharedPtr rc_cmd_pub_;

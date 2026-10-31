@@ -646,7 +646,7 @@ private:
         // 확인하려면 이 셋이 필요하다.
         // 7 은 그 순간의 kp_pitch_rate 자체다 (2026-10-31). 이게 **물에서 ros2 param set
         // 으로 올려가며 튜닝하는 값**이므로, kp_pitch 를 0 번에 실은 것과 같은 이유로
-        // 함께 남겨야 한다 — 없으면 세 번 올려가며 시험한 로그에서 어느 구간이 어느
+        // 함께 남겨야 한다 — 없으면 여러 값으로 시험한 로그에서 어느 구간이 어느
         // 게인이었는지 사후에 갈릴 수 없다. rate_used(4) 는 "쓰였나" 일 뿐 값이 아니다.
         dbg.data = { kp_p_, pitch_ol ? 1.0f : 0.0f, target_pitch, target_roll,
                      rate_used ? 1.0f : 0.0f, pitch_rate_, rate_err,
@@ -657,7 +657,13 @@ private:
     // PID 게인 (r=roll, p=pitch). 요 게인은 없다 — 요 제어 없음 (2026-09-14)
     float kp_r_, ki_r_, kd_r_;
     float kp_p_, ki_p_, kd_p_;
-    float i_limit_;                                          // 적분 누산 한계 (안티 와인드업)
+    // pitch 종속(각속도) 제어 게인 (2026-10-30). 선언 순서 = 생성자 초기화 순서 (-Wreorder, 2026-10-31)
+    float kp_p_angle_;            // 각도오차 -> 목표각속도 [1/s]
+    float kp_p_rate_;             // 각속도오차 -> 등가각도 [s]. **0 = 꺼짐**
+    float rate_max_;              // 목표각속도 상한 [도/초]
+    float rate_lpf_tau_;          // 각속도 LPF 시간상수 [초]. <=0 이면 필터 끔
+    double rate_max_age_;         // 이보다 낡은 각속도는 쓰지 않는다 [초]
+    float i_limit_;               // 적분 누산 한계 (안티 와인드업)
     bool servo_rev_l_, servo_rev_r_;                         // 채널별 장착 방향 반전 (요 서보는 고정이라 없음)
     bool invert_pitch_, invert_roll_;                        // 축별 부호 반전 (믹싱 이전)
     bool pitch_open_loop_;                                   // pitch 개루프 (판별 실험용, 2026-10-14)
@@ -668,12 +674,7 @@ private:
     float prev_err_roll_, prev_err_pitch_;                   // D항 계산용 직전 오차
     float robot_roll_, robot_pitch_;                         // 현재 자세(측정값)
 
-    // pitch 종속(각속도) 제어 상태 (2026-10-30)
-    float kp_p_angle_;            // 각도오차 -> 목표각속도 [1/s]
-    float kp_p_rate_;             // 각속도오차 -> 등가각도 [s]. **0 = 꺼짐(기본)**
-    float rate_max_;              // 목표각속도 상한 [도/초]
-    float rate_lpf_tau_;          // 각속도 LPF 시간상수 [초]. <=0 이면 필터 끔
-    double rate_max_age_;         // 이보다 낡은 각속도는 쓰지 않는다 [초]
+    // pitch 종속(각속도) 제어 상태 (2026-10-30). 게인은 위 PID 게인 옆에 선언됨
     float pitch_rate_ = 0.0f;     // LPF 통과 pitch 각속도 [도/초]
     bool  rate_initialized_ = false;
     rclcpp::Time last_rate_time_{0, 0, RCL_ROS_TIME};
