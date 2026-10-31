@@ -124,6 +124,8 @@ public:
             const float nf = std::numeric_limits<float>::quiet_NaN();
             run_id_ = 0; thr_pct_ = nf; angle_deg_ = nf; run_sec_ = nf;
             kp_pitch_ = nf; pitch_ol_ = 0; target_pitch_ = nf; target_roll_ = nf;
+            kp_rate_ = nf; rate_used_ = 0;                     // 74~77열 (2026-10-31)
+            rate_meas_ = nf; rate_err_ = nf;
         }
         // 2번째 IMU 도 NaN 으로 시작 — 미수신과 0 을 구별
         for (int i = 0; i < 7; i++) mpu_[i] = std::numeric_limits<float>::quiet_NaN();
@@ -180,8 +182,11 @@ public:
                 run_sec_   = m->data[3];
             });
 
-        // PID 진단 (pid_control_node, 100 Hz) — CSV 69~72열. 게인·개루프 스위치는 실행 중
-        // 바뀌므로 "그 순간 무엇으로 제어했나"가 같은 행에 남아야 사후 대조가 된다.
+        // PID 진단 (pid_control_node, 100 Hz) — CSV 69~72열 + 74~76열. 게인·개루프 스위치는
+        // 실행 중 바뀌므로 "그 순간 무엇으로 제어했나"가 같은 행에 남아야 사후 대조가 된다.
+        // 2026-10-31: 발행이 4칸 -> 8칸이 되어 각속도 종속 제어 4칸이 붙었다. 크기 검사를
+        // 4 와 8 로 나눈 이유는 **구 발행자(4칸)와도 계속 맞물려야** 하기 때문이다 —
+        // pid_control_node 만 되돌리거나 먼저 띄워도 69~72열은 그대로 남고 74~77열만 NaN 이 된다.
         pid_debug_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
             "/pid/debug", 10,
             [this](const std_msgs::msg::Float32MultiArray::SharedPtr m) {
@@ -190,6 +195,11 @@ public:
                 pitch_ol_     = static_cast<int32_t>(m->data[1]);
                 target_pitch_ = m->data[2];
                 target_roll_  = m->data[3];
+                if (m->data.size() < 8) return;
+                rate_used_    = static_cast<int32_t>(m->data[4]);
+                rate_meas_    = m->data[5];
+                rate_err_     = m->data[6];
+                kp_rate_      = m->data[7];
             });
 
         // AUTO 대기/주행 상태 (auto_scenario_node, 100 Hz). hydro 배열로 받으면 11 Hz 라
@@ -285,7 +295,17 @@ private:
         //   Kp_pitch/Pitch_OL 은 ros2 param 으로 주행 중에도 바뀌므로 매 행 기록한다.
         //   Target_Pitch/Target_Roll 은 AUTO 면 시나리오 목표, MANUAL 이면 스틱 목표다.
         //   VBat 은 23열 RSSI 와 같은 /rc/status 에서 오고, 센티볼트를 V 로 환산해 둔 것이다.
-        //   ※ 페일세이프·static 구간에서는 /pid/debug 가 발행되지 않아 69~72열에 직전 값이 남는다.
+        //   ※ 페일세이프·static 구간에서는 /pid/debug 가 발행되지 않아 69~72열·74~77열에
+        //     직전 값이 남는다. "제어 중인가"는 이 열들로 판정하지 말고 M1(12열)≠1500 이나
+        //     State(55열)=2 로 가릴 것.
+        // 74~77열: pitch 각속도 종속 제어 (2026-10-31). Kp_rate 가 0 이면 **각도 제어와 수학적으로
+        //   동일**하고 Rate_err 는 출력에 들어가지 않는다(계산만 되어 기록된다 — 켜기 전에 "켰다면
+        //   얼마나 개입했을지"를 미리 볼 수 있다). Kp_rate 는 물에서 ros2 param set 으로 0 -> 0.1 ->
+        //   0.15 로 올려가며 튜닝하는 값이므로, Kp_pitch 를 69열에 넣은 것과 **같은 이유로** 매 행
+        //   남긴다 — 어느 구간이 어느 게인이었는지 로그만으로 갈려야 한다.
+        //   Rate_used: 그 주기에 각속도 항이 실제로 쓰였나 0/1 (Kp_rate=0 이거나 각속도가
+        //     pitch_rate_max_age 보다 낡으면 0 — 즉 각도 제어로 복귀한 주기를 센다)
+        //   Rate_meas: LPF 통과 pitch 각속도 [도/초] / Rate_err: 목표−측정 각속도 [도/초]
         // 64열: Scenario — AUTO 에 걸린 시나리오 ID (2026-10-14). 0 모름/MANUAL · 1 straight ·
         //   2 dive · 3 climb · 4 porpoise · 5 attitude · 6 bank_left · 7 bank_right · 8 static.
         //   **번호는 auto_scenario_node 의 SCEN_* enum 과 짝이다** — 재배정하면 지난 로그가 깨진다.
@@ -301,7 +321,8 @@ private:
                      "Depth,Speed,Q_dyn,Q_raw,P_hydro,Hydro_Pitch,Hydro_Seq,Hydro_Flags,"
                      "Q_zero,Zero_src,Zero_t0,Zero_t1,Still,Q_dyn_wz,Speed_wz,State,"
                      "MPU_AX,MPU_AY,MPU_AZ,MPU_GX,MPU_GY,MPU_GZ,MPU_T,Epoch(s),Scenario,"
-                     "Run_id,Throttle_pct,Angle_deg,Run_sec,Kp_pitch,Pitch_OL,Target_Pitch,Target_Roll,VBat\n");
+                     "Run_id,Throttle_pct,Angle_deg,Run_sec,Kp_pitch,Pitch_OL,Target_Pitch,Target_Roll,VBat,"
+                     "Kp_rate,Rate_used,Rate_meas,Rate_err\n");
         fflush(fp_);   // 헤더는 즉시 기록해 파일이 비어 보이지 않게 한다
 
         return 0;
@@ -531,7 +552,8 @@ private:
                      "%.4f,%d,%.2f,%.2f,%d,%.4f,%.3f,%d,"
                      "%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.1f,"
                      "%.3f,%d,"
-                     "%d,%.1f,%.1f,%.2f,%.3f,%d,%.2f,%.2f,%.2f\n",
+                     "%d,%.1f,%.1f,%.2f,%.3f,%d,%.2f,%.2f,%.2f,"
+                     "%.3f,%d,%.3f,%.3f\n",
                 relative_time_sec,
                 btn1_cumulative_count_,
                 mode_,
@@ -554,7 +576,8 @@ private:
                 mpu_[0], mpu_[1], mpu_[2], mpu_[3], mpu_[4], mpu_[5], mpu_[6],
                 epoch_sec, scenario_id_,
                 run_id_, thr_pct_, angle_deg_, run_sec_,
-                kp_pitch_, pitch_ol_, target_pitch_, target_roll_, vbat1_ / 100.0f);
+                kp_pitch_, pitch_ol_, target_pitch_, target_roll_, vbat1_ / 100.0f,
+                kp_rate_, rate_used_, rate_meas_, rate_err_);
 
         // 50줄(0.5초)마다 디스크로 강제 플러시.
         // 매 줄 플러시하면 SD카드 I/O로 100Hz 루프가 밀리고, 아예 안 하면
@@ -617,6 +640,10 @@ private:
     float   kp_pitch_;                                            // 그 순간 pitch 게인 (69열)
     int32_t pitch_ol_;                                            // pitch 개루프 0/1 (70열)
     float   target_pitch_, target_roll_;                          // 그 순간 목표 각도 [도] (71~72열)
+    float   kp_rate_;                                             // 각속도 종속 게인 [초] (74열, 0=꺼짐)
+    int32_t rate_used_;                                           // 각속도 항 실사용 0/1 (75열)
+    float   rate_meas_, rate_err_;                                // 측정·오차 각속도 [도/초] (76~77열)
+
     float mpu_[7];                                                // MPU9250 [ax ay az g, gx gy gz 도/초, 온도 °C]. 미수신 = NaN
     int32_t rssi_;
     int32_t vbat1_;                                               // 배터리 전압 [센티볼트] (73열, ÷100 해서 기록)

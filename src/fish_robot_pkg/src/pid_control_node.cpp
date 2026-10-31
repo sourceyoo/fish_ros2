@@ -644,8 +644,13 @@ private:
         // 4~6 은 종속 제어 진단 (2026-10-30): 각속도를 실제로 썼는지, 그때 측정
         // 각속도와 각속도오차가 얼마였는지. 튜닝 중 "제동이 걸렸나" 를 로그로
         // 확인하려면 이 셋이 필요하다.
+        // 7 은 그 순간의 kp_pitch_rate 자체다 (2026-10-31). 이게 **물에서 ros2 param set
+        // 으로 올려가며 튜닝하는 값**이므로, kp_pitch 를 0 번에 실은 것과 같은 이유로
+        // 함께 남겨야 한다 — 없으면 세 번 올려가며 시험한 로그에서 어느 구간이 어느
+        // 게인이었는지 사후에 갈릴 수 없다. rate_used(4) 는 "쓰였나" 일 뿐 값이 아니다.
         dbg.data = { kp_p_, pitch_ol ? 1.0f : 0.0f, target_pitch, target_roll,
-                     rate_used ? 1.0f : 0.0f, pitch_rate_, rate_err };
+                     rate_used ? 1.0f : 0.0f, pitch_rate_, rate_err,
+                     kp_p_rate_ };
         debug_pub_->publish(dbg);
     }
 
